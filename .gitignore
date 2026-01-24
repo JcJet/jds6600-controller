@@ -7,4 +7,8 @@ __pycache__/
 venv/
 dist/
 build/
+*.spec
+!packaging/**/*.spec
+
+# Note: spec files are committed because build scripts/GitHub Actions rely on them.
 .DS_Store
