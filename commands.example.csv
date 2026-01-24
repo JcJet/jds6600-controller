@@ -1,0 +1,28 @@
+# JDS6600 command file (CSV)
+# Format:
+#   freq,<Hz>,<optional JSON options>
+#   freq,[Hz1,Hz2,...],<optional JSON options>
+#   cycle,[Hz1,Hz2,...],on=<sec>,off=<sec>,<optional JSON options>
+#   wait,<seconds>
+#
+# Examples:
+#   freq,1000,{"channel":"1+2","waveform":"sine","amplitude":1.0}
+#   wait,2.5
+#   freq,2000,{"channel":1,"waveform":"square","dutycycle":30,"amplitude":2.0}
+#   cycle,[1000,2000,3000],on=5,off=10,{"channel":"1+2"}
+#
+# Notes:
+# - JSON options map to jds6600 methods: set_waveform, set_amplitude, set_offset, set_dutycycle, etc.
+#   Example: {"waveform":"triangle"} -> fg.set_waveform(channel=?, value="triangle")
+# - Channel selection:
+#   {"channel":"both"} (default), {"channel":1}, {"channel":2}
+# - Per-channel overrides:
+#   {"ch1":{"frequency":1000,"amplitude":1.0}, "ch2":{"frequency":1500,"amplitude":1.0}}
+# - Enable/disable outputs:
+#   {"channels":{"channel1":true,"channel2":false}}
+#
+freq,1000,{"channel":"1+2","waveform":"sine","amplitude":1.0}
+wait,2
+freq,2000,{"channel":1,"waveform":"square","dutycycle":30,"amplitude":2.0}
+wait,1.5
+freq,5000,{"ch1":{"frequency":5000,"amplitude":1.0},"ch2":{"frequency":5000,"amplitude":1.0,"offset":0.2}}

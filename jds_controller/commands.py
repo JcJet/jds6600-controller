@@ -1,0 +1,418 @@
+from __future__ import annotations
+
+import ast
+import csv
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+
+@dataclass(frozen=True)
+class FreqStep:
+    hz: float
+    options: Dict[str, Any]
+    source_line: int
+
+
+@dataclass(frozen=True)
+class WaitStep:
+    seconds: float
+    source_line: int
+
+
+@dataclass(frozen=True)
+class StopStep:
+    source_line: int
+
+
+# Public step type consumed by runner.
+Step = Union[FreqStep, WaitStep, StopStep]
+
+
+# Internal raw steps used only during parsing/expansion.
+@dataclass(frozen=True)
+class _FreqListRaw:
+    freqs_hz: List[float]
+    options: Dict[str, Any]
+    source_line: int
+
+
+@dataclass(frozen=True)
+class _CycleRaw:
+    freqs_hz: List[float]
+    on_wait: float
+    off_wait: Optional[float]
+    pause_hz: float
+    options: Dict[str, Any]
+    source_line: int
+
+
+RawStep = Union[Step, _FreqListRaw, _CycleRaw]
+
+
+_WAIT_ALIASES = {"wait", "sleep", "delay"}
+_STOP_ALIASES = {"stop", "off", "disable"}
+_FREQ_ALIASES = {"freq", "frequency", "f"}
+_CYCLE_ALIASES = {"cycle", "loop"}
+
+
+def _is_number(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
+
+def _looks_like_list(s: str) -> bool:
+    st = s.strip()
+    return st.startswith("[") and st.endswith("]")
+
+
+def _consume_bracketed_token(cells: List[str], start_index: int, delimiter: str) -> Tuple[str, int]:
+    """Join CSV cells starting at start_index until a [...] token is balanced.
+
+    Needed when delimiter is ',' and the list contains commas, e.g.:
+      freq,[1000,2000,3000]
+    becomes cells: ['freq','[1000','2000','3000]'].
+
+    Returns (token, next_index).
+    """
+    if start_index >= len(cells):
+        return "", start_index
+
+    first = (cells[start_index] or "").strip()
+    if not first.lstrip().startswith("["):
+        return first, start_index + 1
+
+    parts: List[str] = []
+    balance = 0
+    i = start_index
+    while i < len(cells):
+        p = (cells[i] or "").strip()
+        parts.append(p)
+        balance += p.count("[") - p.count("]")
+        if balance <= 0:
+            i += 1
+            break
+        i += 1
+
+    token = delimiter.join(parts)
+    return token, i
+
+
+def _parse_number_list(token: str, *, line_no: int) -> List[float]:
+    try:
+        obj = ast.literal_eval(token)
+    except Exception as e:
+        raise ValueError(f"Line {line_no}: invalid list syntax for frequencies: {e}")
+    if not isinstance(obj, (list, tuple)):
+        raise ValueError(f"Line {line_no}: frequency list must be like [1000,2000,3000]")
+    out: List[float] = []
+    for x in obj:
+        try:
+            out.append(float(x))
+        except Exception:
+            raise ValueError(f"Line {line_no}: list element '{x}' is not a number")
+    if not out:
+        raise ValueError(f"Line {line_no}: frequency list is empty")
+    return out
+
+
+def _parse_json_options(raw: str, *, line_no: int) -> Dict[str, Any]:
+    """Parse options.
+
+    Supports:
+      - JSON object: {"channel":"1+2","waveform":"sine"}
+      - json: prefix: json:{...}
+      - py: prefix: py:{...} (python dict syntax) (best-effort)
+
+    Also does a few "user-friendly" fixes:
+      - removes trailing commas
+      - auto-quotes keys and simple string values
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+
+    if raw.lower().startswith("json:"):
+        raw = raw[5:].strip()
+    if raw.lower().startswith("py:"):
+        raw = raw[3:].strip()
+
+    def try_json(s: str) -> Dict[str, Any]:
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            raise ValueError("options must be a JSON object")
+        return obj
+
+    # 1) strict JSON
+    try:
+        return try_json(raw)
+    except Exception:
+        pass
+
+    # 2) tolerate trailing commas
+    cur = re.sub(r",\s*([}\]])", r"\1", raw)
+    try:
+        return try_json(cur)
+    except Exception:
+        pass
+
+    # 3) try to fix unquoted keys: {waveform:"sine"} -> {"waveform":"sine"}
+    cur2 = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cur)
+    # 4) quote simple bareword values: {"waveform":sine} -> {"waveform":"sine"}
+    def _quote_val(m: re.Match) -> str:
+        val = m.group(1)
+        if val in {"true", "false", "null"}:
+            return f": {val}{m.group(2)}"
+        # numbers are ok
+        try:
+            float(val)
+            return f": {val}{m.group(2)}"
+        except Exception:
+            return f": \"{val}\"{m.group(2)}"
+
+    cur2 = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cur)
+    try:
+        return try_json(cur2)
+    except Exception as e:
+        raise ValueError(
+            f"Line {line_no}: invalid JSON options: {e}. "
+            f"Hint: JSON requires double quotes and no trailing comma. Options seen: '{raw}'"
+        )
+
+
+def _expand_steps(raw_steps: Sequence[RawStep]) -> List[Step]:
+    """Expand _FreqListRaw and _CycleRaw into a flat list of Steps."""
+    out: List[Step] = []
+    i = 0
+    n = len(raw_steps)
+
+    while i < n:
+        s = raw_steps[i]
+
+        # Clean syntax: cycle,[...],on=5,off=10 (or cycle,[...],5,10)
+        if isinstance(s, _CycleRaw):
+            for f in s.freqs_hz:
+                out.append(FreqStep(hz=float(f), options=s.options, source_line=s.source_line))
+                if s.on_wait > 0:
+                    out.append(WaitStep(seconds=float(s.on_wait), source_line=s.source_line))
+                if s.off_wait is not None:
+                    out.append(FreqStep(hz=float(s.pause_hz), options=s.options, source_line=s.source_line))
+                    if float(s.off_wait) > 0:
+                        out.append(WaitStep(seconds=float(s.off_wait), source_line=s.source_line))
+            i += 1
+            continue
+
+        # Legacy syntax: freq,[...]; optional wait; optional freq,0; optional wait
+        if isinstance(s, _FreqListRaw):
+            freqs = list(s.freqs_hz)
+
+            j = i + 1
+            on_wait: Optional[WaitStep] = None
+            if j < n and isinstance(raw_steps[j], WaitStep):
+                on_wait = raw_steps[j]  # type: ignore[assignment]
+                j += 1
+
+            pause_freq: Optional[FreqStep] = None
+            off_wait: Optional[WaitStep] = None
+            if j < n and isinstance(raw_steps[j], FreqStep) and float(raw_steps[j].hz) == 0.0:
+                pause_freq = raw_steps[j]  # type: ignore[assignment]
+                j += 1
+                if j < n and isinstance(raw_steps[j], WaitStep):
+                    off_wait = raw_steps[j]  # type: ignore[assignment]
+                    j += 1
+
+            for f in freqs:
+                out.append(FreqStep(hz=float(f), options=s.options, source_line=s.source_line))
+                if on_wait is not None:
+                    out.append(WaitStep(seconds=float(on_wait.seconds), source_line=on_wait.source_line))
+                if pause_freq is not None:
+                    out.append(FreqStep(hz=float(pause_freq.hz), options=pause_freq.options, source_line=pause_freq.source_line))
+                    if off_wait is not None:
+                        out.append(WaitStep(seconds=float(off_wait.seconds), source_line=off_wait.source_line))
+
+            i = j
+            continue
+
+        # Flat step
+        out.append(s)  # type: ignore[arg-type]
+        i += 1
+
+    return out
+
+
+def parse_csv_commands(path: str | Path) -> List[Step]:
+    """Parse command CSV file.
+
+    Supported commands (case-insensitive):
+      - freq,<hz_or_[list]>,<optional JSON options>
+      - wait,<seconds>
+      - stop
+      - cycle,<[list]>,<on_seconds>,<off_seconds>,<optional JSON options>
+        - positional: cycle,[1000,2000,3000],5,10
+        - key/value:  cycle,[1000,2000,3000],on=5,off=10,pause_hz=0
+
+    Legacy loop behavior:
+      If you use freq,[list] and it is followed by optional wait, and optional
+      freq,0 + optional wait, then the whole group is applied per element.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    text = p.read_text(encoding="utf-8", errors="replace")
+    if not text.strip():
+        return []
+
+    sample = "\n".join(text.splitlines()[:25])
+    try:
+        dialect0 = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
+        # NOTE: We intentionally disable CSV quoting rules so that JSON fragments like:
+        #   {"waveform":"sine","amplitude":1.0}
+        # can live unquoted inside the CSV. The standard csv module would otherwise
+        # treat parts starting with a quote as "quoted fields" and strip quotes.
+        class _LooseDialect(csv.Dialect):
+            delimiter = dialect0.delimiter
+            quotechar = '"'
+            escapechar = '\\'
+            doublequote = True
+            skipinitialspace = True
+            lineterminator = '\n'
+            quoting = csv.QUOTE_NONE
+        dialect = _LooseDialect
+    except Exception:
+        dialect = csv.get_dialect("excel")
+
+    reader = csv.reader(text.splitlines(), dialect)
+    raw_steps: List[RawStep] = []
+
+    for idx, row in enumerate(reader, start=1):
+        if not row:
+            continue
+        row = [c.strip() for c in row]
+        if not row[0] or row[0].lstrip().startswith("#"):
+            continue
+
+        cmd = (row[0] or "").strip().lower()
+
+        if cmd in _WAIT_ALIASES:
+            if len(row) < 2 or not _is_number(row[1]):
+                raise ValueError(f"Line {idx}: wait expects seconds as number")
+            raw_steps.append(WaitStep(seconds=float(row[1]), source_line=idx))
+            continue
+
+        if cmd in _STOP_ALIASES:
+            raw_steps.append(StopStep(source_line=idx))
+            continue
+
+        if cmd in _FREQ_ALIASES:
+            if len(row) < 2:
+                raise ValueError(f"Line {idx}: freq expects <Hz> or <[list]> as second column")
+            token, next_i = _consume_bracketed_token(row, 1, dialect.delimiter)
+            token = token.strip()
+
+            opts_raw = (dialect.delimiter.join(row[next_i:]) if next_i < len(row) else "")
+            opts = _parse_json_options(opts_raw, line_no=idx) if opts_raw.strip() else {}
+
+            if _looks_like_list(token):
+                freqs = _parse_number_list(token, line_no=idx)
+                raw_steps.append(_FreqListRaw(freqs_hz=freqs, options=opts, source_line=idx))
+            else:
+                if not _is_number(token):
+                    raise ValueError(f"Line {idx}: freq expects a number (Hz) or list like [1000,2000]")
+                raw_steps.append(FreqStep(hz=float(token), options=opts, source_line=idx))
+            continue
+
+        if cmd in _CYCLE_ALIASES:
+            if len(row) < 2:
+                raise ValueError(
+                    f"Line {idx}: cycle expects a list, e.g. cycle,[1000,2000,3000],on=5,off=10"
+                )
+            token, next_i = _consume_bracketed_token(row, 1, dialect.delimiter)
+            token = token.strip()
+            if not _looks_like_list(token):
+                raise ValueError(f"Line {idx}: cycle expects a frequency list like [1000,2000,3000]")
+            freqs = _parse_number_list(token, line_no=idx)
+
+            on_wait: Optional[float] = None
+            off_wait: Optional[float] = None
+            pause_hz: float = 0.0
+
+            j = next_i
+            while j < len(row):
+                cell = (row[j] or "").strip()
+                if not cell:
+                    j += 1
+                    continue
+                # options start
+                if cell.lstrip().startswith("{") or cell.lower().startswith("json:") or cell.lower().startswith("py:"):
+                    break
+
+                if "=" in cell:
+                    k, v = cell.split("=", 1)
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if not _is_number(v):
+                        raise ValueError(f"Line {idx}: cycle parameter '{k}' must be a number")
+                    fv = float(v)
+                    if k in {"on", "wait", "hold", "on_wait"}:
+                        on_wait = fv
+                    elif k in {"off", "pause", "off_wait", "pause_wait"}:
+                        off_wait = fv
+                    elif k in {"pause_hz", "pause_freq", "off_hz", "off_freq"}:
+                        pause_hz = fv
+                    else:
+                        raise ValueError(
+                            f"Line {idx}: unknown cycle parameter '{k}'. Use on=, off=, pause_hz="
+                        )
+                    j += 1
+                    continue
+
+                # positional number
+                if _is_number(cell):
+                    fv = float(cell)
+                    if on_wait is None:
+                        on_wait = fv
+                    elif off_wait is None:
+                        off_wait = fv
+                    else:
+                        raise ValueError(
+                            f"Line {idx}: too many numeric args for cycle. Use cycle,[...],on,off"
+                        )
+                    j += 1
+                    continue
+
+                # unknown token -> treat as start of options; allow users to have a single tail "{...}" without prefix
+                break
+
+            opts_raw = (dialect.delimiter.join(row[j:]) if j < len(row) else "")
+            opts = _parse_json_options(opts_raw, line_no=idx) if opts_raw.strip() else {}
+
+            raw_steps.append(
+                _CycleRaw(
+                    freqs_hz=freqs,
+                    on_wait=float(on_wait or 0.0),
+                    off_wait=off_wait,
+                    pause_hz=float(pause_hz),
+                    options=opts,
+                    source_line=idx,
+                )
+            )
+            continue
+
+        raise ValueError(
+            f"Line {idx}: unknown command '{row[0]}'. Use 'freq', 'wait', 'stop' or 'cycle'."
+        )
+
+    return _expand_steps(raw_steps)
+
+
+def estimate_remaining_wait_time(steps: Sequence[Step], start_index: int) -> float:
+    total = 0.0
+    for s in steps[start_index:]:
+        if isinstance(s, WaitStep):
+            total += float(s.seconds)
+    return total

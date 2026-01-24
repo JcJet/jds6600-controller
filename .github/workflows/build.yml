@@ -1,0 +1,88 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-win64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python (x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+      - name: Build EXE (win64)
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+          ./packaging/windows/build_windows.ps1 -Python python
+      - name: Upload artifact (win64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-win64
+          path: dist/JDS6600Controller-win64.exe
+          if-no-files-found: error
+
+  windows-win32:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python (x86)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x86"
+      - name: Build EXE (win32)
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+          ./packaging/windows/build_windows.ps1 -Python python
+      - name: Upload artifact (win32)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-win32
+          path: dist/JDS6600Controller-win32.exe
+          if-no-files-found: error
+
+  linux-appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps (Tkinter + tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-venv python3-tk curl
+      - name: Build AppImage
+        run: |
+          chmod +x packaging/linux/build_appimage.sh
+          ./packaging/linux/build_appimage.sh
+      - name: Upload artifact (AppImage)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+  release:
+    needs: [windows-win64, windows-win32, linux-appimage]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/windows-win64/JDS6600Controller-win64.exe
+            artifacts/windows-win32/JDS6600Controller-win32.exe
+            artifacts/linux-appimage/*.AppImage
