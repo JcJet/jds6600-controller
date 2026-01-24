@@ -58,7 +58,14 @@ if ! command -v appimagetool >/dev/null 2>&1; then
   echo "Downloading appimagetool..."
   curl -L -o appimagetool https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
   chmod +x appimagetool
-  APPIMAGETOOL=./appimagetool
+
+  # GitHub Actions runners often do not provide /dev/fuse, so running AppImages
+  # directly may fail with: dlopen(): error loading libfuse.so.2
+  # We avoid this by extracting appimagetool and running its AppRun directly.
+  echo "Extracting appimagetool (FUSE-less mode)..."
+  rm -rf squashfs-root
+  ./appimagetool --appimage-extract >/dev/null
+  APPIMAGETOOL=./squashfs-root/AppRun
 else
   APPIMAGETOOL=appimagetool
 fi

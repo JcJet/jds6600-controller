@@ -260,11 +260,22 @@ class App(tk.Tk):
         frm_log = ttk.LabelFrame(frm_mid, text="Лог выполнения")
         frm_mid.add(frm_log, weight=2)
 
-        self.log = tk.Text(frm_log, height=10, wrap="word", state="disabled")
-        self.log.pack(fill="both", expand=True)
-        vsl = ttk.Scrollbar(frm_log, orient="vertical", command=self.log.yview)
+        # NOTE: pack order matters.
+        # If you pack the Text first with fill="both", it can consume all space and
+        # the scrollbar gets squeezed into a tiny widget (looks like a weird mini-scrollbar
+        # in the corner). Pack the scrollbar first, then the Text.
+        vsl = ttk.Scrollbar(frm_log, orient="vertical")
         vsl.pack(side="right", fill="y")
-        self.log.configure(yscrollcommand=vsl.set)
+
+        self.log = tk.Text(
+            frm_log,
+            height=10,
+            wrap="word",
+            state="disabled",
+            yscrollcommand=vsl.set,
+        )
+        self.log.pack(side="left", fill="both", expand=True)
+        vsl.configure(command=self.log.yview)
 
         self._update_linenos()
 
