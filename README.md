@@ -194,5 +194,4 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build_windows.ps1
 ---
 
 ## Ссылки
-- Библиотека управления устройством: https://github.com/JcJet/jds6600-controller
 - Telegram разработчика: https://t.me/JcJet (@JcJet)
