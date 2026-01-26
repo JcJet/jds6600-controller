@@ -200,10 +200,11 @@ def _expand_steps(raw_steps: Sequence[RawStep]) -> List[Step]:
                 out.append(FreqStep(hz=float(f), options=s.options, source_line=s.source_line))
                 if s.on_wait > 0:
                     out.append(WaitStep(seconds=float(s.on_wait), source_line=s.source_line))
-                if s.off_wait is not None:
+                # If off=0, do NOT insert the pause frequency between steps.
+                # (User expectation: "off=0" means no extra 0 Hz / pause step at all.)
+                if s.off_wait is not None and float(s.off_wait) > 0:
                     out.append(FreqStep(hz=float(s.pause_hz), options=s.options, source_line=s.source_line))
-                    if float(s.off_wait) > 0:
-                        out.append(WaitStep(seconds=float(s.off_wait), source_line=s.source_line))
+                    out.append(WaitStep(seconds=float(s.off_wait), source_line=s.source_line))
             i += 1
             continue
 

@@ -29,11 +29,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-tk curl
-          
-      - name: Install AppImage dependencies (FUSE2)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
 
       - name: Build AppImage
         run: |
@@ -84,8 +79,6 @@ jobs:
     needs: [linux-appimage, windows]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
