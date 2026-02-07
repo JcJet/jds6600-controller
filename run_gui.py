@@ -1251,6 +1251,14 @@ class App(tk.Tk):
         if hasattr(self, "btn_connect"):
             self.btn_connect.configure(text="Отключиться" if connected else "Подключиться")
         if connected:
+            # If we auto-connected from settings, status label can remain "Не подключено".
+            # Update it to a sane idle value without clobbering other meaningful statuses.
+            try:
+                if (not getattr(self, "_running", False)) and str(self.status_var.get()).strip() in {"Не подключено", ""}:
+                    self.status_var.set("Подключено")
+            except Exception:
+                pass
+
             # Force next poll to update the status bar (prevents it from being stuck on "Подключено...").
             self._poll_last_text = None
             try:
@@ -1258,6 +1266,12 @@ class App(tk.Tk):
             except Exception:
                 pass
         else:
+            # Keep the top status label consistent with connection state when idle.
+            try:
+                if (not getattr(self, "_running", False)):
+                    self.status_var.set("Не подключено")
+            except Exception:
+                pass
             self.device_state_var.set("Нет подключения")
             self._poll_last_text = "Нет подключения"
             self._poll_last_good_text = None
