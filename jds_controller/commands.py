@@ -28,7 +28,31 @@ class StopStep:
 
 
 # Public step type consumed by runner.
-Step = Union[FreqStep, WaitStep, StopStep]
+@dataclass(frozen=True)
+class ModStep:
+    """Frequency modulation (sweep) step.
+
+    time_s: duration for one sweep leg (start->end or end->start) in seconds.
+    update_ms: how often to send new frequency (and adaptive voltage) to the device, in milliseconds.
+    direction:
+      - rise: start -> end
+      - fall: end -> start
+      - rise-and-fall: start -> end -> start
+    repeat: if True, repeat cycles until stopped.
+    adaptive_voltage: if True, adjust amplitude based on frequency.
+    """
+    start_hz: float
+    end_hz: float
+    time_s: float
+    update_ms: float
+    direction: str
+    adaptive_voltage: bool
+    repeat: bool
+    options: Dict[str, Any]
+    source_line: int
+
+
+Step = Union[FreqStep, WaitStep, StopStep, ModStep]
 
 
 # Internal raw steps used only during parsing/expansion.
@@ -56,6 +80,7 @@ _WAIT_ALIASES = {"wait", "sleep", "delay"}
 _STOP_ALIASES = {"stop", "off", "disable"}
 _FREQ_ALIASES = {"freq", "frequency", "f"}
 _CYCLE_ALIASES = {"cycle", "loop"}
+_MOD_ALIASES = {"mod", "modulate", "sweep"}
 
 
 def _is_number(s: str) -> bool:
@@ -64,6 +89,29 @@ def _is_number(s: str) -> bool:
         return True
     except Exception:
         return False
+
+def _parse_bool(s: str) -> bool:
+    v = (s or "").strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"invalid boolean '{s}' (use true/false)")
+
+
+def _normalize_direction(s: str) -> str:
+    v = (s or "").strip().lower().replace("_", "-")
+    v = v.replace(" ", "-")
+    if v in {"rise", "up", "inc", "increase"}:
+        return "rise"
+    if v in {"fall", "down", "dec", "decrease"}:
+        return "fall"
+    if v in {"rise-and-fall", "rise-fall", "up-down", "up-and-down", "riseandfall"}:
+        return "rise-and-fall"
+    raise ValueError(
+        f"invalid direction '{s}'. Use: rise, fall, rise-and-fall"
+    )
+
 
 
 def _looks_like_list(s: str) -> bool:
@@ -254,6 +302,7 @@ def parse_csv_commands(path: str | Path) -> List[Step]:
       - wait,<seconds>
       - stop
       - cycle,<[list]>,<on_seconds>,<off_seconds>,<optional JSON options>
+      - mod,<params...>,<optional JSON options>
         - positional: cycle,[1000,2000,3000],5,10
         - key/value:  cycle,[1000,2000,3000],on=5,off=10,pause_hz=0
 
@@ -404,8 +453,134 @@ def parse_csv_commands(path: str | Path) -> List[Step]:
             )
             continue
 
+        if cmd in _MOD_ALIASES:
+            # mod (frequency modulation / sweep)
+            # Default params:
+            #   start=1, end=1000000, time=1 (seconds per sweep leg), update=50 (ms), direction=rise-and-fall,
+            #   adaptive-voltage=false, repeat=true
+            start_hz: Optional[float] = None
+            end_hz: Optional[float] = None
+            time_s: Optional[float] = None
+            update_ms: Optional[float] = None
+
+            direction: Optional[str] = None
+            adaptive_voltage: Optional[bool] = None
+            repeat: Optional[bool] = None
+
+            j = 1
+            positional: List[str] = []
+            while j < len(row):
+                cell = (row[j] or "").strip()
+                if not cell:
+                    j += 1
+                    continue
+                # options start
+                if cell.lstrip().startswith("{") or cell.lower().startswith("json:") or cell.lower().startswith("py:"):
+                    break
+                if "=" in cell:
+                    k, v = cell.split("=", 1)
+                    k = k.strip().lower().replace("_", "-")
+                    v = v.strip()
+                    if k in {"start", "from", "start-hz", "f-start"}:
+                        if not _is_number(v):
+                            raise ValueError(f"Line {idx}: mod parameter '{k}' must be a number")
+                        start_hz = float(v)
+                    elif k in {"end", "to", "end-hz", "f-end"}:
+                        if not _is_number(v):
+                            raise ValueError(f"Line {idx}: mod parameter '{k}' must be a number")
+                        end_hz = float(v)
+                    elif k in {"time", "time-s", "s", "sec", "secs", "second", "seconds", "cycle", "cycle-s", "duration", "duration-s"}:
+                        if not _is_number(v):
+                            raise ValueError(f"Line {idx}: mod parameter '{k}' must be a number (seconds)")
+                        time_s = float(v)
+                    elif k in {"time-ms", "ms", "cycle-ms", "duration-ms"}:
+                        if not _is_number(v):
+                            raise ValueError(f"Line {idx}: mod parameter '{k}' must be a number (milliseconds)")
+                        time_s = float(v) / 1000.0
+                    elif k in {"update", "update-ms", "interval", "interval-ms", "tick", "tick-ms", "step", "step-ms"}:
+                        if not _is_number(v):
+                            raise ValueError(f"Line {idx}: mod parameter '{k}' must be a number (milliseconds)")
+                        update_ms = float(v)
+                    elif k in {"direction", "dir"}:
+                        direction = _normalize_direction(v)
+                    elif k in {"adaptive-voltage", "adaptive", "adaptivevoltage", "adaptive-voltage?", "adaptive_voltage"}:
+                        adaptive_voltage = _parse_bool(v)
+                    elif k in {"repeat", "loop"}:
+                        repeat = _parse_bool(v)
+                    else:
+                        raise ValueError(
+                            f"Line {idx}: unknown mod parameter '{k}'. Use start=, end=, time= (seconds), update= (ms), direction=, adaptive-voltage=, repeat="
+                        )
+                    j += 1
+                    continue
+
+                positional.append(cell)
+                j += 1
+
+            # positional: start,end,time(seconds),direction,adaptive_voltage,repeat,update-ms
+            if positional:
+                if len(positional) > 7:
+                    raise ValueError(
+                        f"Line {idx}: too many positional args for mod. Use mod,start,end,time_seconds,direction,adaptive-voltage,repeat,update_ms"
+                    )
+                if len(positional) >= 1:
+                    if not _is_number(positional[0]):
+                        raise ValueError(f"Line {idx}: mod start must be a number")
+                    start_hz = float(positional[0])
+                if len(positional) >= 2:
+                    if not _is_number(positional[1]):
+                        raise ValueError(f"Line {idx}: mod end must be a number")
+                    end_hz = float(positional[1])
+                if len(positional) >= 3:
+                    if not _is_number(positional[2]):
+                        raise ValueError(f"Line {idx}: mod time must be a number (seconds)")
+                    time_s = float(positional[2])
+                if len(positional) >= 4:
+                    direction = _normalize_direction(positional[3])
+                if len(positional) >= 5:
+                    adaptive_voltage = _parse_bool(positional[4])
+                if len(positional) >= 6:
+                    repeat = _parse_bool(positional[5])
+                if len(positional) >= 7:
+                    if not _is_number(positional[6]):
+                        raise ValueError(f"Line {idx}: mod update interval must be a number (milliseconds)")
+                    update_ms = float(positional[6])
+
+            start_hz = float(start_hz if start_hz is not None else 1.0)
+            end_hz = float(end_hz if end_hz is not None else 1_000_000.0)
+            time_s = float(time_s if time_s is not None else 1.0)
+            update_ms = float(update_ms if update_ms is not None else 50.0)
+            direction = direction if direction is not None else "rise-and-fall"
+            adaptive_voltage = bool(adaptive_voltage) if adaptive_voltage is not None else False
+            repeat = bool(repeat) if repeat is not None else True
+
+            if start_hz < 0 or end_hz < 0:
+                raise ValueError(f"Line {idx}: mod start/end must be >= 0")
+            if time_s <= 0:
+                raise ValueError(f"Line {idx}: mod time must be > 0 (seconds)")
+            if update_ms <= 0:
+                raise ValueError(f"Line {idx}: mod update interval must be > 0 (milliseconds)")
+
+            opts_raw = (dialect.delimiter.join(row[j:]) if j < len(row) else "")
+            opts = _parse_json_options(opts_raw, line_no=idx) if opts_raw.strip() else {}
+
+            raw_steps.append(
+                ModStep(
+                    start_hz=float(start_hz),
+                    end_hz=float(end_hz),
+                    time_s=float(time_s),
+                    update_ms=float(update_ms),
+                    direction=str(direction),
+                    adaptive_voltage=bool(adaptive_voltage),
+                    repeat=bool(repeat),
+                    options=opts,
+                    source_line=idx,
+                )
+            )
+            continue
+
         raise ValueError(
-            f"Line {idx}: unknown command '{row[0]}'. Use 'freq', 'wait', 'stop' or 'cycle'."
+            f"Line {idx}: unknown command '{row[0]}'. Use 'freq', 'wait', 'stop', 'cycle' or 'mod'."
         )
 
     return _expand_steps(raw_steps)
