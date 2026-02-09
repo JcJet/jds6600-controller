@@ -2,6 +2,8 @@
 # 2. https://t.me/apparat_sveta/130450/160535
 # 3. в конце - работа с чакрой.
 
+mod,start=1,end=10000,time=200,update=20,direction=rise-and-fall,adaptive-voltage=true,repeat=true,{"channel":"1","waveform":"sine"}
+
 cycle,[30000,30000,44000,100000,100000,150000,352000,386000,395000,400000,404000,408000,434000],on=180,off=0,{"amplitude":20,"waveform":"cmos", "dutycycle":38.2,"offset":0.8}
 
 cycle,[434000,408000,404000,400000,395000,386000,352000,150000,100000,100000,44000,30000,30000,],on=180,off=0,{"amplitude":20,"waveform":"cmos", "dutycycle":38.2,"offset":0.8}

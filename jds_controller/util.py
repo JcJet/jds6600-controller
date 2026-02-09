@@ -3,12 +3,19 @@ from __future__ import annotations
 import os
 import sys
 import time
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 
 def fmt_seconds(sec: float) -> str:
-    sec = max(0.0, float(sec))
+    try:
+        sec = float(sec)
+    except Exception:
+        return "--"
+    if not math.isfinite(sec):
+        return "∞"
+    sec = max(0.0, sec)
     if sec < 60:
         return f"{sec:.1f}s"
     m = int(sec // 60)

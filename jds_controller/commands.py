@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import csv
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,7 +53,42 @@ class ModStep:
     source_line: int
 
 
-Step = Union[FreqStep, WaitStep, StopStep, ModStep]
+
+@dataclass(frozen=True)
+class CycleRangeSpec:
+    """Lazy frequency range specification for cycle.
+
+    Generates an inclusive sequence from start_hz to end_hz using step_hz increments.
+    step_hz may be positive or negative; sign defines direction.
+    """
+    start_hz: float
+    end_hz: float
+    step_hz: float
+
+
+CycleItem = Union[float, CycleRangeSpec]
+
+
+@dataclass(frozen=True)
+class CycleStep:
+    """Cycle through a list of frequencies (supports lazy ranges).
+
+    items: list of floats and/or CycleRangeSpec.
+    on_wait: seconds to hold each frequency (if >0).
+    off_wait: optional seconds to hold pause_hz between frequencies (if provided and >0).
+    pause_hz: frequency to set during off_wait (default 0 Hz).
+    adaptive_voltage: if True, adjust amplitude based on frequency (same curve as mod).
+    """
+    items: List[CycleItem]
+    on_wait: float
+    off_wait: Optional[float]
+    pause_hz: float
+    adaptive_voltage: bool
+    options: Dict[str, Any]
+    source_line: int
+
+
+Step = Union[FreqStep, WaitStep, StopStep, ModStep, CycleStep]
 
 
 # Internal raw steps used only during parsing/expansion.
@@ -63,17 +99,7 @@ class _FreqListRaw:
     source_line: int
 
 
-@dataclass(frozen=True)
-class _CycleRaw:
-    freqs_hz: List[float]
-    on_wait: float
-    off_wait: Optional[float]
-    pause_hz: float
-    options: Dict[str, Any]
-    source_line: int
-
-
-RawStep = Union[Step, _FreqListRaw, _CycleRaw]
+RawStep = Union[Step, _FreqListRaw]
 
 
 _WAIT_ALIASES = {"wait", "sleep", "delay"}
@@ -169,6 +195,110 @@ def _parse_number_list(token: str, *, line_no: int) -> List[float]:
     return out
 
 
+def _parse_cycle_items(token: str, *, line_no: int) -> List[CycleItem]:
+    """Parse cycle list token allowing numbers and range objects.
+
+    Supports list syntax like:
+      [30000, 44000, {"start": 55000, "end": 200000, "step": 0.1}, 1000000]
+
+    Notes:
+      - step defaults to 1.0
+      - range is inclusive (includes end when aligned)
+      - does NOT materialize the range into a list (keeps CycleRangeSpec)
+      - best-effort tolerance for unquoted keys inside dict items (e.g. step: 0.1)
+    """
+    raw = (token or "").strip()
+    if not (_looks_like_list(raw)):
+        raise ValueError(
+            f"Line {line_no}: cycle expects a list of frequencies, e.g. [1000,2000,3000]."
+        )
+
+    # First try JSON (more user-friendly for dicts), with a few tolerant cleanups.
+    cur = re.sub(r",\s*([}\]])", r"\1", raw)  # remove trailing commas
+    # quote bare keys inside dicts: {start:1} -> {"start":1}
+    cur = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cur)
+
+    obj: Any = None
+    try:
+        obj = json.loads(cur)
+    except Exception:
+        try:
+            obj = ast.literal_eval(raw)
+        except Exception as e:
+            raise ValueError(
+                f"Line {line_no}: can't parse cycle frequency list. "
+                f"Use a list like [30000, 44000, {{\"start\":55000,\"end\":200000,\"step\":0.1}}, 1000000]. "
+                f"Details: {e}"
+            )
+
+    if not isinstance(obj, (list, tuple)):
+        raise ValueError(
+            f"Line {line_no}: cycle list must be like [1000,2000,3000] or include ranges like "
+            f"{{\"start\":55000,\"end\":200000,\"step\":0.1}}"
+        )
+
+    import math as _math
+
+    items: List[CycleItem] = []
+    for pos, x in enumerate(obj, start=1):
+        # Number => single frequency
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            fx = float(x)
+            if not _math.isfinite(fx):
+                raise ValueError(f"Line {line_no}: cycle element #{pos} frequency must be a finite number")
+            items.append(fx)
+            continue
+        # Dict => range spec
+        if isinstance(x, dict):
+            allowed = {"start", "end", "step"}
+            extra = [k for k in x.keys() if str(k) not in allowed]
+            if extra:
+                extras = ", ".join(sorted(map(str, extra)))
+                raise ValueError(
+                    f"Line {line_no}: cycle element #{pos} has unknown field(s): {extras}. "
+                    f"Allowed: start, end, step. Example: {{\"start\":55000,\"end\":200000,\"step\":0.1}}"
+                )
+            if "start" not in x or "end" not in x:
+                raise ValueError(
+                    f"Line {line_no}: cycle element #{pos} range must contain 'start' and 'end'. "
+                    f"Example: {{\"start\":55000,\"end\":200000,\"step\":0.1}}"
+                )
+            try:
+                start_hz = float(x.get("start"))
+                end_hz = float(x.get("end"))
+            except Exception:
+                raise ValueError(f"Line {line_no}: cycle element #{pos} range start/end must be numbers")
+            if not (_math.isfinite(start_hz) and _math.isfinite(end_hz)):
+                raise ValueError(f"Line {line_no}: cycle element #{pos} range start/end must be finite numbers")
+            step_val = x.get("step", 1)
+            try:
+                step_hz = float(step_val)
+            except Exception:
+                raise ValueError(f"Line {line_no}: cycle element #{pos} range step must be a number")
+            if not _math.isfinite(step_hz):
+                raise ValueError(f"Line {line_no}: cycle element #{pos} range step must be a finite number")
+            if step_hz == 0:
+                raise ValueError(f"Line {line_no}: cycle element #{pos} range step must not be 0")
+            if start_hz == end_hz:
+                items.append(float(start_hz))
+                continue
+            # Normalize step direction to match start->end
+            step_hz = abs(step_hz)
+            if end_hz < start_hz:
+                step_hz = -step_hz
+            items.append(CycleRangeSpec(start_hz=float(start_hz), end_hz=float(end_hz), step_hz=float(step_hz)))
+            continue
+
+        raise ValueError(
+            f"Line {line_no}: cycle element #{pos} must be either a number (Hz) or a range object. "
+            f"Example: [30000, 44000, {{\"start\":55000,\"end\":200000,\"step\":0.1}}, 1000000]"
+        )
+
+    if not items:
+        raise ValueError(f"Line {line_no}: cycle list is empty")
+    return items
+
+
 def _parse_json_options(raw: str, *, line_no: int) -> Dict[str, Any]:
     """Parse options.
 
@@ -179,7 +309,7 @@ def _parse_json_options(raw: str, *, line_no: int) -> Dict[str, Any]:
 
     Also does a few "user-friendly" fixes:
       - removes trailing commas
-      - auto-quotes keys and simple string values
+      - auto-quotes keys and simple string values (best-effort)
     """
     raw = (raw or "").strip()
     if not raw:
@@ -209,28 +339,31 @@ def _parse_json_options(raw: str, *, line_no: int) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 3) try to fix unquoted keys: {waveform:"sine"} -> {"waveform":"sine"}
+    # 3) quote bare keys: {waveform:"sine"} -> {"waveform":"sine"}
     cur2 = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cur)
-    # 4) quote simple bareword values: {"waveform":sine} -> {"waveform":"sine"}
+
+    # 4) quote simple bareword values: {"waveform":sine} -> {"waveform":"sine"} (best-effort)
     def _quote_val(m: re.Match) -> str:
         val = m.group(1)
+        tail = m.group(2)
         if val in {"true", "false", "null"}:
-            return f": {val}{m.group(2)}"
-        # numbers are ok
+            return f": {val}{tail}"
         try:
             float(val)
-            return f": {val}{m.group(2)}"
+            return f": {val}{tail}"
         except Exception:
-            return f": \"{val}\"{m.group(2)}"
+            return f': "{val}"{tail}'
 
-    cur2 = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cur)
+    cur3 = re.sub(r":\s*([A-Za-z_][A-Za-z0-9_+-]*)(\s*[,}])", _quote_val, cur2)
+
     try:
-        return try_json(cur2)
+        return try_json(cur3)
     except Exception as e:
         raise ValueError(
             f"Line {line_no}: invalid JSON options: {e}. "
             f"Hint: JSON requires double quotes and no trailing comma. Options seen: '{raw}'"
         )
+
 
 
 def _expand_steps(raw_steps: Sequence[RawStep]) -> List[Step]:
@@ -241,20 +374,6 @@ def _expand_steps(raw_steps: Sequence[RawStep]) -> List[Step]:
 
     while i < n:
         s = raw_steps[i]
-
-        # Clean syntax: cycle,[...],on=5,off=10 (or cycle,[...],5,10)
-        if isinstance(s, _CycleRaw):
-            for f in s.freqs_hz:
-                out.append(FreqStep(hz=float(f), options=s.options, source_line=s.source_line))
-                if s.on_wait > 0:
-                    out.append(WaitStep(seconds=float(s.on_wait), source_line=s.source_line))
-                # If off=0, do NOT insert the pause frequency between steps.
-                # (User expectation: "off=0" means no extra 0 Hz / pause step at all.)
-                if s.off_wait is not None and float(s.off_wait) > 0:
-                    out.append(FreqStep(hz=float(s.pause_hz), options=s.options, source_line=s.source_line))
-                    out.append(WaitStep(seconds=float(s.off_wait), source_line=s.source_line))
-            i += 1
-            continue
 
         # Legacy syntax: freq,[...]; optional wait; optional freq,0; optional wait
         if isinstance(s, _FreqListRaw):
@@ -385,11 +504,12 @@ def parse_csv_commands(path: str | Path) -> List[Step]:
             token = token.strip()
             if not _looks_like_list(token):
                 raise ValueError(f"Line {idx}: cycle expects a frequency list like [1000,2000,3000]")
-            freqs = _parse_number_list(token, line_no=idx)
+            items = _parse_cycle_items(token, line_no=idx)
 
             on_wait: Optional[float] = None
             off_wait: Optional[float] = None
             pause_hz: float = 0.0
+            adaptive_voltage: bool = False
 
             j = next_i
             while j < len(row):
@@ -403,20 +523,26 @@ def parse_csv_commands(path: str | Path) -> List[Step]:
 
                 if "=" in cell:
                     k, v = cell.split("=", 1)
-                    k = k.strip().lower()
+                    k = k.strip().lower().replace("_", "-")
                     v = v.strip()
+
+                    if k in {"adaptive-voltage", "adaptive", "adaptivevoltage"}:
+                        adaptive_voltage = _parse_bool(v)
+                        j += 1
+                        continue
+
                     if not _is_number(v):
                         raise ValueError(f"Line {idx}: cycle parameter '{k}' must be a number")
                     fv = float(v)
-                    if k in {"on", "wait", "hold", "on_wait"}:
+                    if k in {"on", "wait", "hold", "on-wait", "onwait"}:
                         on_wait = fv
-                    elif k in {"off", "pause", "off_wait", "pause_wait"}:
+                    elif k in {"off", "pause", "off-wait", "offwait", "pause-wait", "pausewait"}:
                         off_wait = fv
-                    elif k in {"pause_hz", "pause_freq", "off_hz", "off_freq"}:
+                    elif k in {"pause-hz", "pause-freq", "off-hz", "off-freq"}:
                         pause_hz = fv
                     else:
                         raise ValueError(
-                            f"Line {idx}: unknown cycle parameter '{k}'. Use on=, off=, pause_hz="
+                            f"Line {idx}: unknown cycle parameter '{k}'. Use on=, off=, pause_hz=, adaptive-voltage=true"
                         )
                     j += 1
                     continue
@@ -442,11 +568,12 @@ def parse_csv_commands(path: str | Path) -> List[Step]:
             opts = _parse_json_options(opts_raw, line_no=idx) if opts_raw.strip() else {}
 
             raw_steps.append(
-                _CycleRaw(
-                    freqs_hz=freqs,
+                CycleStep(
+                    items=items,
                     on_wait=float(on_wait or 0.0),
                     off_wait=off_wait,
                     pause_hz=float(pause_hz),
+                    adaptive_voltage=bool(adaptive_voltage),
                     options=opts,
                     source_line=idx,
                 )
@@ -591,4 +718,131 @@ def estimate_remaining_wait_time(steps: Sequence[Step], start_index: int) -> flo
     for s in steps[start_index:]:
         if isinstance(s, WaitStep):
             total += float(s.seconds)
+    return total
+
+
+def _cycle_range_count(spec: CycleRangeSpec) -> int:
+    """Count inclusive points in the range without materializing it."""
+    import math as _math
+    try:
+        start = float(spec.start_hz)
+        end = float(spec.end_hz)
+        step = float(spec.step_hz)
+    except Exception:
+        return 0
+    if step == 0:
+        return 0
+    # ensure step direction matches span
+    span = end - start
+    if span == 0:
+        return 1
+    if span > 0 and step < 0:
+        step = -step
+    if span < 0 and step > 0:
+        step = -step
+    # number of steps (inclusive)
+    try:
+        n = int(_math.floor((span / step) + 1e-12)) + 1
+    except Exception:
+        return 0
+    if n < 1:
+        return 0
+    return n
+
+
+def _cycle_items_count(items: Sequence[CycleItem]) -> int:
+    total = 0
+    for it in items:
+        if isinstance(it, CycleRangeSpec):
+            total += _cycle_range_count(it)
+        else:
+            total += 1
+    return total
+
+
+def cycle_range_count(spec: CycleRangeSpec) -> int:
+    """Count points in a CycleRangeSpec without materializing the range.
+
+    This is the inclusive count of generated frequencies.
+    """
+    return _cycle_range_count(spec)
+
+
+def cycle_items_count(items: Sequence[CycleItem]) -> int:
+    """Count points in cycle items (floats + ranges) without materializing ranges."""
+    return _cycle_items_count(items)
+
+
+def estimate_step_duration(s: Step, *, fixed_wait: Optional[float] = None) -> float:
+    """Estimate duration in seconds for a single step.
+
+    - freq/stop: 0
+    - wait: wait seconds (or fixed_wait if provided)
+    - cycle: count(items) * (on_wait + off_wait when enabled), with fixed_wait applied per wait
+    - mod: finite duration if repeat=false; infinite if repeat=true
+    """
+    import math as _math
+
+    if isinstance(s, WaitStep):
+        if fixed_wait is not None:
+            try:
+                return max(0.0, float(fixed_wait))
+            except Exception:
+                return max(0.0, float(s.seconds))
+        return max(0.0, float(s.seconds))
+
+    if isinstance(s, CycleStep):
+        count = _cycle_items_count(s.items)
+        if count <= 0:
+            return 0.0
+
+        def _eff_wait(w: Optional[float]) -> float:
+            if w is None:
+                return 0.0
+            try:
+                wv = float(w)
+            except Exception:
+                return 0.0
+            if wv <= 0:
+                return 0.0
+            if fixed_wait is not None:
+                try:
+                    return max(0.0, float(fixed_wait))
+                except Exception:
+                    return max(0.0, wv)
+            return max(0.0, wv)
+
+        on = _eff_wait(s.on_wait)
+        off = _eff_wait(s.off_wait) if s.off_wait is not None else 0.0
+        return float(count) * float(on + off)
+
+    if isinstance(s, ModStep):
+        if bool(s.repeat):
+            return _math.inf
+        legs = 2 if str(s.direction) == "rise-and-fall" else 1
+        try:
+            return max(0.0, float(s.time_s) * float(legs))
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
+def estimate_remaining_run_time(
+    steps: Sequence[Step],
+    start_index: int,
+    *,
+    fixed_wait: Optional[float] = None,
+) -> float:
+    """Estimate remaining run time in seconds from start_index (inclusive).
+
+    Returns math.inf if any remaining step is unbounded (e.g. mod with repeat=true).
+    """
+    import math as _math
+    total = 0.0
+    for s in steps[start_index:]:
+        d = estimate_step_duration(s, fixed_wait=fixed_wait)
+        if _math.isinf(d):
+            return _math.inf
+        total += float(d)
     return total

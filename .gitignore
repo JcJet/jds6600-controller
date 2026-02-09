@@ -12,3 +12,6 @@ build/
 
 # Note: spec files are committed because build scripts/GitHub Actions rely on them.
 .DS_Store
+
+# temp files created by the GUI when running unsaved editor content
+_tmp_*.csv
