@@ -327,8 +327,19 @@ def run_sequence(
             progress(i, est_remaining, step)
 
             # Pause gate
+            # While paused, still poll device state periodically so GUI can display
+            # real parameters (important for startup auto-resume which enters paused state).
+            _pause_poll_last = 0.0
             while state.paused and not state.stopped:
-                sleep_with_control(0.1, is_paused=is_paused, is_stopped=is_stopped)
+                if (not dry_run) and fg is not None and on_device_state is not None:
+                    now = time.monotonic()
+                    if (not _pause_poll_last) or (now - _pause_poll_last) >= float(state_poll_interval or 1.0):
+                        _pause_poll_last = now
+                        try:
+                            on_device_state(format_device_state(read_device_state(fg)))
+                        except Exception:
+                            pass
+                time.sleep(0.05)
 
             if state.stopped:
                 status("Stopped.")
@@ -450,16 +461,21 @@ def run_sequence(
 
                 _last_state_poll = 0.0
 
+                skip_cycle_element = False
+
                 def _cycle_sleep(phase: str, seconds: float, *, item_i: int, sub_k: int, sub_n: int, override_remaining: Optional[float] = None) -> None:
                     nonlocal _last_state_poll
                     eff = float(seconds)
                     if override_remaining is not None:
                         eff = max(0.0, float(override_remaining))
 
-                    # If user requested 'next', skip this wait immediately.
+                    nonlocal skip_cycle_element
+                    # If user requested 'next', treat it as skipping the current *cycle element*
+                    # (single frequency or whole range). We also skip any pending wait immediately.
                     if getattr(state, 'skip_wait', False):
+                        skip_cycle_element = True
                         state.skip_wait = False
-                        eff = 0.0
+                        return
 
                     if eff <= 0.0:
                         return
@@ -493,8 +509,9 @@ def run_sequence(
                         on_tick=on_tick,
                         tick_interval=0.25,
                     )
-                    # consume skip if pressed during the wait
+                    # If skip was pressed during the wait, consume it and mark to skip the current element.
                     if getattr(state, 'skip_wait', False):
+                        skip_cycle_element = True
                         state.skip_wait = False
 
                 def _set_freq(freq_hz: float, *, item_i: int, sub_k: int, sub_n: int) -> None:
@@ -544,6 +561,13 @@ def run_sequence(
                         for sub_k, freq, sub_n in _iter_cycle_range(item, start_k=sub_start):
                             if state.stopped:
                                 break
+                            # If user requested 'next', skip the whole current cycle element (range)
+                            if getattr(state, 'skip_wait', False):
+                                skip_cycle_element = True
+                                state.skip_wait = False
+                            if skip_cycle_element:
+                                skip_cycle_element = False
+                                break
                             # Set frequency for this point
                             _set_freq(freq, item_i=item_i, sub_k=sub_k, sub_n=sub_n)
 
@@ -554,6 +578,9 @@ def run_sequence(
                             # on-wait
                             if on_s > 0.0 and phase != "off":
                                 _cycle_sleep("on", on_s, item_i=item_i, sub_k=sub_k, sub_n=sub_n, override_remaining=rem if phase == "on" else None)
+                            if skip_cycle_element:
+                                skip_cycle_element = False
+                                break
 
                             # off-wait (pause)
                             if off_s > 0.0:
@@ -561,6 +588,9 @@ def run_sequence(
                                 for ch in cycle_channels:
                                     fg.set_frequency(channel=ch, value=float(pause_hz))
                                 _cycle_sleep("off", off_s, item_i=item_i, sub_k=sub_k, sub_n=sub_n, override_remaining=rem if phase == "off" else None)
+                            if skip_cycle_element:
+                                skip_cycle_element = False
+                                break
 
                             # consume resume after the first applicable point
                             if phase:
@@ -572,6 +602,13 @@ def run_sequence(
 
                     else:
                         # single frequency element
+                        # If user requested 'next', skip to the next element immediately.
+                        if getattr(state, 'skip_wait', False):
+                            state.skip_wait = False
+                            continue
+                        if skip_cycle_element:
+                            skip_cycle_element = False
+                            continue
                         freq = float(item)
                         sub_n = 1
                         sub_k = start_sub_k if item_i == start_item_i else 0
@@ -584,10 +621,16 @@ def run_sequence(
 
                         if on_s > 0.0 and phase != "off":
                             _cycle_sleep("on", on_s, item_i=item_i, sub_k=0, sub_n=sub_n, override_remaining=rem if phase == "on" else None)
+                        if skip_cycle_element:
+                            skip_cycle_element = False
+                            continue
                         if off_s > 0.0:
                             for ch in cycle_channels:
                                 fg.set_frequency(channel=ch, value=float(pause_hz))
                             _cycle_sleep("off", off_s, item_i=item_i, sub_k=0, sub_n=sub_n, override_remaining=rem if phase == "off" else None)
+                        if skip_cycle_element:
+                            skip_cycle_element = False
+                            continue
 
                         if phase:
                             resume_phase = ""
