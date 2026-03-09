@@ -79,14 +79,71 @@ jobs:
     needs: [linux-appimage, windows]
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
 
+      - name: Build release zip archives
+        run: |
+          python - <<'PY2'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          import shutil
+
+          root = Path('.')
+          assets = root / 'release-assets'
+          out = root / 'release-bundles'
+          out.mkdir(exist_ok=True)
+
+          programs = root / 'programs'
+          linux_stage = out / 'JDS6600Controller-linux'
+          windows_stage = out / 'JDS6600Controller-windows'
+          linux_stage.mkdir(parents=True, exist_ok=True)
+          windows_stage.mkdir(parents=True, exist_ok=True)
+
+          # add binaries
+          appimages = sorted(assets.glob('**/*.AppImage'))
+          for src in appimages:
+              shutil.copy2(src, linux_stage / src.name)
+          exes = sorted(assets.glob('**/*.exe'))
+          for src in exes:
+              shutil.copy2(src, windows_stage / src.name)
+
+          # add programs folder (entire contents)
+          def copy_programs(dst_root: Path):
+              dst = dst_root / 'programs'
+              dst.mkdir(parents=True, exist_ok=True)
+              if programs.exists():
+                  for item in programs.rglob('*'):
+                      rel = item.relative_to(programs)
+                      target = dst / rel
+                      if item.is_dir():
+                          target.mkdir(parents=True, exist_ok=True)
+                      else:
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copy2(item, target)
+
+          copy_programs(linux_stage)
+          copy_programs(windows_stage)
+
+          def make_zip(stage_dir: Path, zip_name: str):
+              zip_path = out / zip_name
+              with ZipFile(zip_path, 'w', compression=ZIP_DEFLATED) as zf:
+                  for path in sorted(stage_dir.rglob('*')):
+                      if path.is_dir():
+                          continue
+                      zf.write(path, path.relative_to(stage_dir))
+
+          make_zip(linux_stage, 'JDS6600Controller-linux.zip')
+          make_zip(windows_stage, 'JDS6600Controller-windows.zip')
+          PY2
+
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/**/*.AppImage
-            release-assets/**/*.exe
+            release-bundles/JDS6600Controller-linux.zip
+            release-bundles/JDS6600Controller-windows.zip

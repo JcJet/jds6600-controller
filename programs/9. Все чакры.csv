@@ -1,0 +1,33 @@
+# чакры. по часу на каждую. снизу вверх.
+
+# МУЛАДХАРА
+freq,583680,{waveform: sine, amplitude:20, offset:0, dutycycle:50}
+wait,3600
+
+# СВАДХИСТАНА
+freq,811008,{waveform: sine, amplitude:20, offset:0, dutycycle:50}
+wait,3600
+
+# МАНИПУРА
+freq,854016,{waveform: sine, amplitude:20, offset:0, dutycycle:50}
+wait,3600
+
+# АНАХАТА
+freq,1081344,{waveform: sine, amplitude:20, offset:0, dutycycle:50}
+wait,3600
+
+# ВИШУДХА
+freq,654336,{waveform: sine, amplitude:20, offset:0, dutycycle:50}
+wait,3600
+
+# АДЖНА
+freq,758784,{waveform: sine, amplitude:20, offset:0, dutycycle:50}
+wait,3600
+
+# САХАСРАРА
+freq,872448,{waveform: sine, amplitude:20, offset:0, dutycycle:50}
+wait,3600
+
+# САХАСРАДАЛА
+freq,493056,{waveform: sine, amplitude:20, offset:0, dutycycle:50}
+wait,3600

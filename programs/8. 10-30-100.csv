@@ -1,0 +1,1 @@
+cycle,[10000,30000,100000],on=420,off=0,{"amplitude":20,"waveform":"cmos", "dutycycle":38.2,"offset":0.8}
