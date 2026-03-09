@@ -80,6 +80,7 @@ def fmt_hhmmss(sec: float) -> str:
 from .settings_store import load_settings, save_settings
 from .resume_store import ResumeStore
 from .messages import GuiMsg, MsgKind, ProgressPayload, DonePayload
+from .i18n import detect_language, tr as i18n_tr, translate_runtime_text
 from . import ui
 
 
@@ -96,7 +97,9 @@ class UiPortItem:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("JDS6600 Controller")
+        self._initial_settings = load_settings()
+        self.lang = detect_language((self._initial_settings or {}).get("language"))
+        self.title(i18n_tr(self.lang, "app_title"))
         self.geometry("1280x760")
         self.minsize(1120, 680)
 
@@ -121,6 +124,7 @@ class App(tk.Tk):
 
         # variables
         self.port_var = tk.StringVar(value="")
+        self.lang_var = tk.StringVar(value=self.lang)
         # Default channel on first run (when no settings yet): CH1.
         self.channel_var = tk.StringVar(value="1")
         self.wait_override_enabled = tk.BooleanVar(value=False)
@@ -131,11 +135,11 @@ class App(tk.Tk):
         # Shows only the estimated remaining time of the current run.
         self.remaining_time_var = tk.StringVar(value="--:--:--")
         # Keep the old status variable for internal / log-friendly messages.
-        self.status_var = tk.StringVar(value="Не подключено")
-        self.device_var = tk.StringVar(value="не проверено")
+        self.status_var = tk.StringVar(value=self.tr("status_not_connected"))
+        self.device_var = tk.StringVar(value=self.tr("device_unchecked"))
         self.progress_var = tk.DoubleVar(value=0.0)
 
-        self.device_state_var = tk.StringVar(value="Нет подключения")
+        self.device_state_var = tk.StringVar(value=self.tr("device_state_none"))
 
         # --- remaining-time countdown model (smooth UI updates) ---
         # We receive coarse estimates on step boundaries and richer checkpoints
@@ -187,9 +191,72 @@ class App(tk.Tk):
         # UI construction extracted into jds_controller.gui.ui
         ui.build_ui(self, github_url=PROJECT_GITHUB_URL, telegram_url=PROJECT_TELEGRAM_URL)
 
+    def tr(self, key: str, **kwargs) -> str:
+        return i18n_tr(self.lang, key, **kwargs)
+
+    def _change_language(self, lang: str) -> None:
+        lang = detect_language(lang)
+        if lang == self.lang:
+            return
+        editor_text = self.editor.get("1.0", "end-1c") if hasattr(self, "editor") else ""
+        log_text = self.log.get("1.0", "end-1c") if hasattr(self, "log") else ""
+        current_port = self.port_var.get()
+        highlight_line = None
+        try:
+            ranges = self.editor.tag_ranges("current_line")
+            if ranges:
+                highlight_line = int(str(ranges[0]).split(".")[0])
+        except Exception:
+            pass
+        prev_status = self.status_var.get()
+        prev_device = self.device_var.get()
+        prev_device_state = self.device_state_var.get()
+        self.lang = lang
+        self.lang_var.set(lang)
+        try:
+            self.config(menu="")
+        except Exception:
+            pass
+        for child in list(self.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        self._build_ui()
+        self._refresh_ports(do_probe=False)
+        if current_port:
+            self.port_var.set(current_port)
+        self._suppress_modified = True
+        try:
+            self.editor.delete("1.0", "end")
+            self.editor.insert("1.0", editor_text)
+            self.editor.edit_modified(False)
+            self.log.configure(state="normal")
+            self.log.delete("1.0", "end")
+            if log_text:
+                self.log.insert("1.0", log_text)
+            self.log.configure(state="disabled")
+        finally:
+            self._suppress_modified = False
+        if highlight_line:
+            self._highlight_source_line(highlight_line)
+        self.status_var.set(translate_runtime_text(prev_status, self.lang))
+        self.device_var.set(translate_runtime_text(prev_device, self.lang))
+        self.device_state_var.set(translate_runtime_text(prev_device_state, self.lang))
+        if (not self._running) and (not self._connected):
+            self.status_var.set(self.tr("status_not_connected"))
+            self.device_state_var.set(self.tr("device_state_none"))
+        self._set_connected_ui(self._connected, self._connected_port or "")
+        self._set_led("ok" if self._connected else "unknown")
+        self._set_running_ui(self._running)
+        if self._running:
+            self.btn_pause.config(text=self.tr("btn_resume") if self.state.paused else self.tr("btn_pause"))
+        self._set_dirty(self._dirty)
+        self._persist_settings()
+
     def _set_dirty(self, dirty: bool):
         self._dirty = dirty
-        title = "JDS6600 Controller"
+        title = self.tr("app_title")
         if self.current_file:
             title += f" — {self.current_file.name}"
         if self._dirty:
@@ -212,12 +279,74 @@ class App(tk.Tk):
             self._set_dirty(True)
             self.editor.edit_modified(False)
 
+    def _programs_dir(self) -> Path:
+        """Return the preferred directory for command files.
+
+        When bundled, prefer a sibling ``programs`` folder next to the executable.
+        During development, prefer the repository-level ``programs`` folder.
+        """
+        candidates = []
+        try:
+            if getattr(sys, "frozen", False):
+                candidates.append(Path(sys.executable).resolve().parent / "programs")
+        except Exception:
+            pass
+        try:
+            candidates.append(Path(__file__).resolve().parents[2] / "programs")
+        except Exception:
+            pass
+        for c in candidates:
+            try:
+                if c.exists() and c.is_dir():
+                    return c
+            except Exception:
+                pass
+        return candidates[0] if candidates else Path.home()
+
+    def _default_file_dialog_dir(self) -> str:
+        try:
+            if self.current_file and self.current_file.parent.exists():
+                return str(self.current_file.parent)
+        except Exception:
+            pass
+        try:
+            return str(self._programs_dir())
+        except Exception:
+            return str(Path.home())
+
+    def _default_startup_commands_file(self) -> Optional[Path]:
+        candidates = []
+        try:
+            programs = self._programs_dir()
+            candidates.extend([
+                programs / "commands.csv",
+                programs / "commands.example.csv",
+            ])
+        except Exception:
+            pass
+        try:
+            root = Path(__file__).resolve().parents[2]
+            candidates.extend([
+                root / "commands.csv",
+                root / "commands.example.csv",
+            ])
+        except Exception:
+            pass
+        for c in candidates:
+            try:
+                if c.exists():
+                    return c
+            except Exception:
+                pass
+        return None
+
     def _browse_open(self):
         if not self._confirm_discard_if_dirty():
             return
         path = filedialog.askopenfilename(
-            title="Открыть файл команд",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            title=self.tr("title_open"),
+            initialdir=self._default_file_dialog_dir(),
+            filetypes=[(self.tr("filetypes_csv"), "*.csv"), (self.tr("filetypes_all"), "*.*")]
         )
         if not path:
             return
@@ -227,7 +356,7 @@ class App(tk.Tk):
         try:
             txt = path.read_text(encoding="utf-8")
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
+            messagebox.showerror(self.tr("title_error"), self.tr("msg_open_failed", error=e))
             return
 
         self._suppress_modified = True
@@ -241,7 +370,7 @@ class App(tk.Tk):
         self.current_file = path
         self._set_dirty(False)
         self._clear_highlight()
-        self._log(f"Открыт файл: {path}")
+        self._log(self.tr("log_file_opened", path=path))
 
     def _save(self):
         if not self.current_file:
@@ -249,15 +378,17 @@ class App(tk.Tk):
         try:
             self.current_file.write_text(self.editor.get("1.0", "end-1c"), encoding="utf-8")
             self._set_dirty(False)
-            self._log(f"Сохранено: {self.current_file}")
+            self._log(self.tr("log_file_saved", path=self.current_file))
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить:\n{e}")
+            messagebox.showerror(self.tr("title_error"), self.tr("msg_save_failed", error=e))
 
     def _save_as(self):
         path = filedialog.asksaveasfilename(
-            title="Сохранить как",
+            title=self.tr("title_save_as"),
+            initialdir=self._default_file_dialog_dir(),
+            initialfile=(self.current_file.name if self.current_file else "commands.csv"),
             defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            filetypes=[(self.tr("filetypes_csv"), "*.csv"), (self.tr("filetypes_all"), "*.*")]
         )
         if not path:
             return
@@ -303,7 +434,7 @@ class App(tk.Tk):
     def _confirm_discard_if_dirty(self) -> bool:
         if not self._dirty:
             return True
-        res = messagebox.askyesnocancel("Несохранённые изменения", "Файл изменён. Сохранить изменения?")
+        res = messagebox.askyesnocancel(self.tr("title_unsaved"), self.tr("msg_unsaved"))
         if res is None:
             return False
         if res is True:
@@ -321,7 +452,7 @@ class App(tk.Tk):
         label = f"{p.device} ({p.description or 'n/a'}) | {extra}"
         return UiPortItem(label=label, port=p.device)
 
-    def _refresh_ports(self):
+    def _refresh_ports(self, do_probe: bool = True):
         by_id = list_linux_by_id_ports()
         ports = list_serial_ports()
 
@@ -350,7 +481,8 @@ class App(tk.Tk):
                 # keep combobox value consistent with its values list (prevents UI glitches)
                 self.port_var.set(values[0])
 
-        self._probe_selected_port_async()
+        if do_probe:
+            self._probe_selected_port_async()
 
     def _extract_port_value(self, raw: str) -> str:
         raw = (raw or "").strip()
@@ -372,23 +504,30 @@ class App(tk.Tk):
     def _probe_selected_port_async(self):
         port = self._extract_port_value(self.port_var.get())
         if not port:
-            self.device_var.set("не выбран")
+            self.device_var.set(self.tr("device_not_selected"))
             self._set_led("unknown")
             return
-        self.device_var.set("проверка…")
+        self.device_var.set(self.tr("device_checking"))
         self._set_led("unknown")
 
         def worker():
             ok = False
             try:
-                import jds6600
-                fg = jds6600.JDS6600(port=port)
-                fg.connect()
-                try:
-                    fg.get_channels()
-                finally:
-                    fg.close()
-                ok = True
+                if self._connected and self._connected_port == port:
+                    ok = True
+                else:
+                    with self._io_lock:
+                        if self._connected and self._connected_port == port:
+                            ok = True
+                        else:
+                            import jds6600
+                            fg = jds6600.JDS6600(port=port)
+                            fg.connect()
+                            try:
+                                fg.get_channels()
+                            finally:
+                                fg.close()
+                            ok = True
             except Exception:
                 ok = False
             self.msgq.put(GuiMsg(MsgKind.PROBE, bool(ok)))
@@ -396,8 +535,8 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _auto_detect(self):
-        self.status_var.set("Поиск устройства…")
-        self._log("Авто-поиск устройства…")
+        self.status_var.set(self.tr("status_searching_device"))
+        self._log(self.tr("log_autodetect_start"))
 
         def worker():
             import jds6600
@@ -405,7 +544,7 @@ class App(tk.Tk):
                 port = find_first_jds6600()
                 self.msgq.put(GuiMsg(MsgKind.AUTODETECT, port or ""))
             except Exception as e:
-                self.msgq.put(GuiMsg(MsgKind.ERROR, f"Авто-поиск: {e}"))
+                self.msgq.put(GuiMsg(MsgKind.ERROR, self.tr("log_autodetect_error", error=e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -418,7 +557,7 @@ class App(tk.Tk):
                 raise ValueError()
             return v
         except Exception:
-            raise ValueError("Неверное значение фиксированного wait (сек). Введите число >= 0.")
+            raise ValueError(self.tr("msg_invalid_fixed_wait"))
 
     def _get_effective_commands_path_for_run(self) -> Path:
         """
@@ -440,9 +579,9 @@ class App(tk.Tk):
             parse_csv_commands(p)
             if self.wait_override_enabled.get():
                 _ = self._get_wait_override_seconds()
-            messagebox.showinfo("Проверка", "Файл команд корректен.")
+            messagebox.showinfo(self.tr("title_check"), self.tr("msg_commands_ok"))
         except Exception as e:
-            messagebox.showerror("Ошибка CSV", self._format_csv_error_for_ui(e, text))
+            messagebox.showerror(self.tr("title_csv_error"), self._format_csv_error_for_ui(e, text))
 
     def _format_csv_error_for_ui(self, e: Exception, source_text: str) -> str:
         """Format parser errors with helpful context (line snippet, etc.).
@@ -469,7 +608,7 @@ class App(tk.Tk):
 
         out = [msg]
         if line_text:
-            out.extend(["", f"Строка {line_no}:", line_text])
+            out.extend(["", self.tr("line_context", line=line_no), line_text])
 
         # Best-effort extraction of a failing cycle element.
         m2 = re.search(r"cycle element #(?P<pos>\d+)", msg, flags=re.IGNORECASE)
@@ -481,7 +620,7 @@ class App(tk.Tk):
             if pos > 0:
                 elem = self._try_extract_cycle_element(line_text, pos)
                 if elem:
-                    out.extend(["", f"Проблемный элемент #{pos}: {elem}"])
+                    out.extend(["", self.tr("problematic_element", pos=pos, elem=elem)])
 
         return "\n".join(out)
 
@@ -542,7 +681,7 @@ class App(tk.Tk):
         self.btn_next.config(state="normal" if running else "disabled")
         self.btn_stop.config(state="normal" if running else "disabled")
         if not running:
-            self.btn_pause.config(text="Пауза")
+            self.btn_pause.config(text=self.tr("btn_pause"))
 
     # ---------------- Run / resume helpers ----------------
 
@@ -576,7 +715,7 @@ class App(tk.Tk):
             try:
                 fixed_wait = self._get_wait_override_seconds()
             except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
+                messagebox.showerror(self.tr("title_error"), str(e))
                 return
 
         self.state.paused = bool(start_paused)
@@ -597,11 +736,11 @@ class App(tk.Tk):
         self._set_running_ui(True)
         # Reflect paused state immediately in the UI.
         try:
-            self.btn_pause.config(text="Продолжить" if self.state.paused else "Пауза")
+            self.btn_pause.config(text=self.tr("btn_resume") if self.state.paused else self.tr("btn_pause"))
         except Exception:
             pass
 
-        self.status_var.set("Запуск…" if not start_paused else "Восстановлено (пауза)…")
+        self.status_var.set(self.tr("status_launching") if not start_paused else self.tr("status_restored_paused"))
 
         def on_status(msg: str):
             self.msgq.put(GuiMsg(MsgKind.STATUS, msg))
@@ -658,7 +797,7 @@ class App(tk.Tk):
 
         port = self._extract_port_value(self.port_var.get())
         if not port:
-            messagebox.showerror("Ошибка", "Выберите порт (или нажмите Авто-поиск).")
+            messagebox.showerror(self.tr("title_error"), self.tr("msg_select_port"))
             return
 
         src_text = self.editor.get("1.0", "end-1c") if hasattr(self, "editor") else ""
@@ -666,7 +805,7 @@ class App(tk.Tk):
             cmd_path = self._get_effective_commands_path_for_run()
             steps = parse_csv_commands(cmd_path)
         except Exception as e:
-            messagebox.showerror("Ошибка CSV", self._format_csv_error_for_ui(e, src_text))
+            messagebox.showerror(self.tr("title_csv_error"), self._format_csv_error_for_ui(e, src_text))
             return
 
         self._start_worker(port=port, steps=steps, cmd_path=Path(cmd_path), resume_ck=None, start_paused=False)
@@ -706,15 +845,15 @@ class App(tk.Tk):
             steps = parse_csv_commands(self.current_file)
         except Exception as e:
             # If the file no longer parses, do not attempt to auto-run.
-            self._log("Auto-resume disabled: CSV parse error")
+            self._log(self.tr("log_auto_resume_disabled_parse"))
             try:
-                messagebox.showerror("Ошибка CSV", self._format_csv_error_for_ui(e, src_text))
+                messagebox.showerror(self.tr("title_csv_error"), self._format_csv_error_for_ui(e, src_text))
             except Exception:
                 pass
             return
 
         self._resume_autostart_done = True
-        self._log("== AUTO-RESUME (paused) ==")
+        self._log(self.tr("log_auto_resume"))
         self._start_worker(port=port, steps=steps, cmd_path=self.current_file, resume_ck=resume_ck, start_paused=True)
 
     def _toggle_pause(self):
@@ -738,14 +877,14 @@ class App(tk.Tk):
             pass
 
         self.state.paused = not was_paused
-        self.btn_pause.config(text="Продолжить" if self.state.paused else "Пауза")
-        self._log("== PAUSE ==" if self.state.paused else "== RESUME ==")
+        self.btn_pause.config(text=self.tr("btn_resume") if self.state.paused else self.tr("btn_pause"))
+        self._log(self.tr("log_pause") if self.state.paused else self.tr("log_resume"))
 
     def _next_command(self):
         if not self._running:
             return
         self.state.skip_wait = True
-        self._log("== NEXT COMMAND (skip wait) ==")
+        self._log(self.tr("log_next_command"))
 
     def _stop(self):
         if not self._running:
@@ -753,7 +892,7 @@ class App(tk.Tk):
         self.state.stopped = True
         self.state.paused = False
         self.state.skip_wait = True
-        self._log("== STOP requested ==")
+        self._log(self.tr("log_stop"))
 
     # ---------------- Help / About ----------------
 
@@ -761,7 +900,7 @@ class App(tk.Tk):
         try:
             webbrowser.open(url)
         except Exception as e:
-            messagebox.showerror("Не удалось открыть браузер", str(e))
+            messagebox.showerror(self.tr("title_browser_error"), str(e))
 
     def _show_help(self):
         # Extracted into jds_controller.gui.ui
@@ -769,9 +908,8 @@ class App(tk.Tk):
 
     def _about(self):
         messagebox.showinfo(
-            "О программе",
-            "JDS6600 Controller\n\nGUI/CLI утилита для управления генератором JDS6600.\n"
-            f"GitHub: {PROJECT_GITHUB_URL}\nTelegram: {PROJECT_TELEGRAM_URL} (@JcJet)"
+            self.tr("title_about"),
+            self.tr("about_text", github=PROJECT_GITHUB_URL, telegram=PROJECT_TELEGRAM_URL)
         )
 
     # ---------------- Editor context menu & shortcuts ----------------
@@ -837,9 +975,9 @@ class App(tk.Tk):
     # ---------------- Settings / close ----------------
 
     def _load_settings_and_init(self):
-        s = load_settings()
+        s = self._initial_settings if isinstance(self._initial_settings, dict) else load_settings()
         # init ports
-        self._refresh_ports()
+        self._refresh_ports(do_probe=False)
 
         # apply saved values
         if isinstance(s.get("channel"), str) and s["channel"] in {"1+2","1","2"}:
@@ -856,17 +994,20 @@ class App(tk.Tk):
         if isinstance(fp, str) and fp and Path(fp).exists():
             self._open_file(Path(fp))
         else:
-            # load default sample if exists
-            default = Path(__file__).with_name("commands.csv")
-            if default.exists():
+            # load a default sample if available
+            default = self._default_startup_commands_file()
+            if default is not None and default.exists():
                 self._open_file(default)
 
         port = s.get("port")
         if isinstance(port, str) and port:
-            # Set as-is; if it's a label, extract will map
+            # Set as-is; if it's a label, extract will map.
+            # Connect directly; probing here only creates a startup race on the first launch.
             self.port_var.set(port)
+            self._connect_selected_port_async(silent=True)
+        else:
+            # On first launch without saved settings, probe the auto-selected port only.
             self._probe_selected_port_async()
-            self._connect_selected_port_async()
 
         # If a resume point exists for the startup file, auto-enter the paused execution state.
         # Run this after initial UI+settings setup.
@@ -876,7 +1017,7 @@ class App(tk.Tk):
             pass
 
     def _persist_settings(self):
-        s = load_settings()
+        s = self._initial_settings if isinstance(self._initial_settings, dict) else load_settings()
         if not isinstance(s, dict):
             s = {}
         s.update({
@@ -886,6 +1027,7 @@ class App(tk.Tk):
             "wait_override_enabled": bool(self.wait_override_enabled.get()),
             "wait_override_seconds": self.wait_override_seconds.get(),
             "repeat_file_enabled": bool(self.repeat_file_enabled.get()),
+            "language": self.lang,
         })
         save_settings(s)
 
@@ -897,7 +1039,7 @@ class App(tk.Tk):
         allow_resume_save = True
 
         if self._dirty:
-            res = messagebox.askyesnocancel("Несохранённые изменения", "Файл изменён. Сохранить изменения?")
+            res = messagebox.askyesnocancel(self.tr("title_unsaved"), self.tr("msg_unsaved"))
             if res is None:
                 return
             if res is True:
@@ -981,30 +1123,33 @@ class App(tk.Tk):
                 payload = msg.payload
 
                 if kind == MsgKind.STATUS:
-                    self.status_var.set(str(payload))
-                    self._log(str(payload))
+                    txt = translate_runtime_text(str(payload), self.lang)
+                    self.status_var.set(txt)
+                    self._log(txt)
 
                 elif kind == MsgKind.PROBE:
                     ok = bool(payload)
                     if ok:
-                        self.device_var.set("устройство найдено")
+                        self.device_var.set(self.tr("device_found"))
                         self._set_led("ok")
                     else:
-                        self.device_var.set("не найдено")
+                        self.device_var.set(self.tr("device_not_found"))
                         self._set_led("bad")
 
                 elif kind == MsgKind.AUTODETECT:
                     port = str(payload or "")
                     if port:
                         self.port_var.set(port)
-                        self._probe_selected_port_async()
-                        # Auto-connect after successful auto-detect
+                        self.device_var.set(self.tr("device_found"))
+                        self._set_led("ok")
+                        # Auto-connect after successful auto-detect.
+                        # Do not start a separate probe here: it races with connect on first launch.
                         self._connect_selected_port_async()
-                        self.status_var.set(f"Найдено устройство: {port}")
-                        self._log(f"Авто-поиск: найдено на {port}")
+                        self.status_var.set(self.tr("status_device_found", port=port))
+                        self._log(self.tr("log_autodetect_found", port=port))
                     else:
-                        self.status_var.set("Устройство не найдено")
-                        self._log("Авто-поиск: устройство не найдено")
+                        self.status_var.set(self.tr("status_device_not_found"))
+                        self._log(self.tr("log_autodetect_not_found"))
 
                 elif kind == MsgKind.CONNECTED:
                     port = str(payload or "")
@@ -1016,8 +1161,8 @@ class App(tk.Tk):
                         pass
                     # Keep the top status label in sync (avoid being stuck on 'Не подключено' at startup).
                     try:
-                        if (not self._running) and (self.status_var.get() in ("Не подключено", "")):
-                            self.status_var.set("Подключено")
+                        if (not self._running) and (self.status_var.get() in (self.tr("status_not_connected"), "", "Не подключено", "Not connected")):
+                            self.status_var.set(self.tr("status_connected"))
                     except Exception:
                         pass
 
@@ -1025,21 +1170,31 @@ class App(tk.Tk):
                     self._set_connected_ui(False)
                     try:
                         if not self._running:
-                            self.status_var.set("Не подключено")
+                            self.status_var.set(self.tr("status_not_connected"))
                     except Exception:
                         pass
 
                 elif kind == MsgKind.CONNECT_ERROR:
                     self._set_connected_ui(False)
-                    self._log(f"Ошибка подключения: {payload}")
-                    messagebox.showerror("Ошибка подключения", str(payload))
+                    show_popup = True
+                    err_text = payload
+                    try:
+                        if isinstance(payload, dict):
+                            err_text = str(payload.get("error", ""))
+                            show_popup = bool(payload.get("show_popup", True))
+                    except Exception:
+                        err_text = str(payload)
+                        show_popup = True
+                    if show_popup:
+                        self._log(self.tr("log_connect_error", error=err_text))
+                        messagebox.showerror(self.tr("title_connect_error"), str(err_text))
 
                 elif kind == MsgKind.DEVICE_STATE:
-                    txt = str(payload)
+                    txt = translate_runtime_text(str(payload), self.lang)
                     self.device_state_var.set(txt)
                     # Keep polling bookkeeping in sync with UI updates
                     self._poll_last_text = txt
-                    if txt and txt not in {"Нет подключения", "Подключено (нет данных)"}:
+                    if txt and txt not in {self.tr("device_state_none"), self.tr("device_state_no_data"), "Нет подключения", "Подключено (нет данных)", "No connection", "Connected (no data)"}:
                         self._poll_last_good_text = txt
 
                 elif kind == MsgKind.CHECKPOINT:
@@ -1048,7 +1203,7 @@ class App(tk.Tk):
                         self._remaining_apply_checkpoint(payload)
 
                 elif kind == MsgKind.LOG:
-                    self._log(str(payload))
+                    self._log(translate_runtime_text(str(payload), self.lang))
 
                 elif kind == MsgKind.PROGRESS:
                     done = total = 0
@@ -1098,7 +1253,7 @@ class App(tk.Tk):
 
                     self.progress_var.set(100.0)
                     self.remaining_time_var.set("00:00:00")
-                    self.status_var.set("Остановлено" if rc == 4 else "Готово")
+                    self.status_var.set(self.tr("status_stopped") if rc == 4 else self.tr("status_done"))
                     self._set_running_ui(False)
                     self._clear_highlight()
 
@@ -1120,8 +1275,8 @@ class App(tk.Tk):
                     should_repeat = (rc == 0 and bool(self.repeat_file_enabled.get()))
                     if should_repeat:
                         try:
-                            self.status_var.set("Повтор файла: перезапуск")
-                            self._log("Повтор файла: запуск заново")
+                            self.status_var.set(self.tr("status_repeat_restart"))
+                            self._log(self.tr("log_repeat_restart"))
                         except Exception:
                             pass
                         # Do not reconnect in-between repeats to avoid port contention.
@@ -1140,9 +1295,9 @@ class App(tk.Tk):
                             self._connect_selected_port_async()
 
                 elif kind == MsgKind.ERROR:
-                    self.status_var.set("Ошибка")
-                    self._log(f"ERROR: {payload}")
-                    messagebox.showerror("Ошибка", str(payload))
+                    self.status_var.set(self.tr("status_error"))
+                    self._log(self.tr("log_error", error=payload))
+                    messagebox.showerror(self.tr("title_error"), str(payload))
                     self._set_running_ui(False)
                     self._clear_highlight()
                     # Restore connection after an error as well.
@@ -1403,7 +1558,7 @@ class App(tk.Tk):
         self._connected = connected
         self._connected_port = (port or self._connected_port) if connected else None
         if hasattr(self, "btn_connect"):
-            self.btn_connect.configure(text="Отключиться" if connected else "Подключиться")
+            self.btn_connect.configure(text=self.tr("btn_disconnect") if connected else self.tr("btn_connect"))
         if connected:
             # Force next poll to update the status bar (prevents it from being stuck on "Подключено...").
             self._poll_last_text = None
@@ -1412,8 +1567,8 @@ class App(tk.Tk):
             except Exception:
                 pass
         else:
-            self.device_state_var.set("Нет подключения")
-            self._poll_last_text = "Нет подключения"
+            self.device_state_var.set(self.tr("device_state_none"))
+            self._poll_last_text = self.tr("device_state_none")
             self._poll_last_good_text = None
             try:
                 self._poll_force.set()
@@ -1423,17 +1578,17 @@ class App(tk.Tk):
     def _toggle_connection(self) -> None:
         if self._running:
             # during execution we keep the script priority; manual connect/disconnect is disabled
-            self._log("Во время выполнения сценария подключение управляется автоматически.")
+            self._log(self.tr("log_connect_managed"))
             return
         if self._connected:
             self._disconnect_async()
         else:
             self._connect_selected_port_async()
 
-    def _connect_selected_port_async(self) -> None:
+    def _connect_selected_port_async(self, silent: bool = False) -> None:
         port = self._extract_port_value(self.port_var.get())
         if not port:
-            self._log("Не выбран порт.")
+            self._log(self.tr("log_port_not_selected"))
             return
         # Already connected to this port
         if self._connected and self._connected_port == port:
@@ -1441,22 +1596,31 @@ class App(tk.Tk):
 
         def worker():
             import jds6600
-            try:
-                fg = jds6600.JDS6600(port=port)
-                fg.connect()
-                with self._fg_lock:
-                    # close previous connection if any
+            last_err = None
+            for attempt in range(2):
+                try:
+                    with self._io_lock:
+                        fg = jds6600.JDS6600(port=port)
+                        fg.connect()
+                        with self._fg_lock:
+                            # close previous connection if any
+                            try:
+                                if self._fg is not None:
+                                    self._fg.close()
+                            except Exception:
+                                pass
+                            self._fg = fg
+                            self._connected = True
+                            self._connected_port = port
+                    self.msgq.put(GuiMsg(MsgKind.CONNECTED, port))
+                    return
+                except Exception as e:
+                    last_err = e
                     try:
-                        if self._fg is not None:
-                            self._fg.close()
+                        time.sleep(0.25)
                     except Exception:
                         pass
-                    self._fg = fg
-                    self._connected = True
-                    self._connected_port = port
-                self.msgq.put(GuiMsg(MsgKind.CONNECTED, port))
-            except Exception as e:
-                self.msgq.put(GuiMsg(MsgKind.CONNECT_ERROR, str(e)))
+            self.msgq.put(GuiMsg(MsgKind.CONNECT_ERROR, {"error": str(last_err), "show_popup": (not silent)}))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1503,7 +1667,7 @@ class App(tk.Tk):
 
             # Snapshot connection and fg reference quickly.
             if not self._connected:
-                text = "Нет подключения"
+                text = self.tr("device_state_none")
                 if text != self._poll_last_text:
                     self.msgq.put(GuiMsg(MsgKind.DEVICE_STATE, text))
                     self._poll_last_text = text
@@ -1513,7 +1677,7 @@ class App(tk.Tk):
                 fg = self._fg
 
             if fg is None:
-                text = "Нет подключения"
+                text = self.tr("device_state_none")
                 if text != self._poll_last_text:
                     self.msgq.put(GuiMsg(MsgKind.DEVICE_STATE, text))
                     self._poll_last_text = text
@@ -1532,8 +1696,8 @@ class App(tk.Tk):
                     now = time.monotonic()
                     if now - float(self._poll_last_error_ts) >= float(self._poll_error_throttle_sec):
                         self._poll_last_error_ts = now
-                        self.msgq.put(GuiMsg(MsgKind.LOG, f"Status poll error: {e}"))
-                    text = self._poll_last_good_text or "Подключено (нет данных)"
+                        self.msgq.put(GuiMsg(MsgKind.LOG, self.tr("log_status_poll_error", error=e)))
+                    text = self._poll_last_good_text or self.tr("device_state_no_data")
             finally:
                 try:
                     self._io_lock.release()
