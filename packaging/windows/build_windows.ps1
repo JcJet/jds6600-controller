@@ -29,10 +29,10 @@ if ($Arch -ne "auto") {
   }
 }
 
-$arch = $detectedArch
+$buildArch = $detectedArch
 
 # Per-arch / per-target venv (so builds can coexist on one machine)
-$venvSuffix = if ($LegacyWin7) { "$arch-win7legacy" } else { $arch }
+$venvSuffix = if ($LegacyWin7) { "$buildArch-win7legacy" } else { $buildArch }
 $VenvDir = ".venv-$venvSuffix"
 & $Python -m venv $VenvDir
 $PyExe = Join-Path $VenvDir "Scripts\python.exe"
@@ -61,7 +61,7 @@ if (-not (Test-Path "dist\JDS6600Controller.exe")) {
 if ($LegacyWin7) {
   $out = "dist\JDS6600Controller-win7-legacy.exe"
 } else {
-  $out = "dist\JDS6600Controller-$arch.exe"
+  $out = "dist\JDS6600Controller-$buildArch.exe"
 }
 Copy-Item "dist\JDS6600Controller.exe" $out -Force
 Write-Host "Built: $out"

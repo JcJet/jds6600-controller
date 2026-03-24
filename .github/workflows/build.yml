@@ -75,7 +75,7 @@ jobs:
           path: dist/JDS6600Controller-win${{ matrix.arch }}.exe
 
   windows-win7-legacy:
-    runs-on: windows-2019
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
