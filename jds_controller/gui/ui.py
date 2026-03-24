@@ -36,6 +36,10 @@ def build_ui(app, *, github_url: str, telegram_url: str) -> None:
     runmenu.add_command(label=t("menu_next_command"), command=app._next_command)
     runmenu.add_command(label=t("menu_stop"), command=app._stop)
     runmenu.add_separator()
+    runmenu.add_checkbutton(label=t("menu_enable_outputs_on_start"), variable=app.enable_outputs_on_start)
+    runmenu.add_checkbutton(label=t("menu_disable_outputs_on_finish"), variable=app.disable_outputs_on_finish)
+    runmenu.add_checkbutton(label=t("menu_shutdown_pc_on_finish"), variable=app.shutdown_pc_on_finish)
+    runmenu.add_separator()
     runmenu.add_command(label=t("menu_validate"), command=app._validate)
     menubar.add_cascade(label=t("menu_run"), menu=runmenu)
 

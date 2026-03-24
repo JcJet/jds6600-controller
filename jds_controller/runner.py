@@ -211,6 +211,43 @@ def _iter_cycle_range(spec: CycleRangeSpec, start_k: int = 0):
             freq = end
         yield k, float(freq), int(n)
 
+
+def _step_channels_used(step: Step, default_channel: str) -> List[int]:
+    """Return channels a step is expected to use for signal output."""
+    if isinstance(step, WaitStep) or isinstance(step, StopStep):
+        return []
+
+    opts = getattr(step, "options", None) or {}
+    channels: List[int] = []
+
+    if isinstance(opts.get("ch1"), dict):
+        channels.append(1)
+    if isinstance(opts.get("ch2"), dict):
+        channels.append(2)
+    if channels:
+        return sorted(set(channels))
+
+    return _channels_from_selector(opts.get("channel"), default_channel)
+
+
+def _used_outputs_for_steps(steps: Sequence[Step], default_channel: str) -> Dict[str, bool]:
+    """Inspect the script and decide which physical outputs should be enabled.
+
+    We look only at steps that can emit a signal (freq/cycle/mod).
+    If no such step exists, fall back to the selected default channel.
+    """
+    used: set[int] = set()
+    for step in steps:
+        used.update(_step_channels_used(step, default_channel))
+
+    if not used:
+        used.update(_channels_from_selector(default_channel, default_channel))
+
+    return {
+        "channel1": 1 in used,
+        "channel2": 2 in used,
+    }
+
 def run_sequence(
     steps: Sequence[Step],
     *,
@@ -226,6 +263,7 @@ def run_sequence(
     state_poll_interval: float = 1.0,
     resume: Optional[Dict[str, Any]] = None,
     on_checkpoint: Optional[Callable[[Dict[str, Any]], None]] = None,
+    enable_outputs_on_start: bool = True,
 ) -> int:
     """
     Run steps on the device. Returns exit code:
@@ -306,6 +344,16 @@ def run_sequence(
             fg = jds6600.JDS6600(port=port)
             fg.connect()
             status(f"Connected to {port}")
+            if enable_outputs_on_start:
+                try:
+                    start_at = max(0, int(resume_step_index)) if resume_step_index else 0
+                    outputs = _used_outputs_for_steps(steps[start_at:], default_channel)
+                    fg.set_channels(
+                        channel1=bool(outputs.get("channel1", False)),
+                        channel2=bool(outputs.get("channel2", False)),
+                    )
+                except Exception as e:
+                    status(f"Could not enable outputs at start: {e}")
 
         total = len(steps)
 

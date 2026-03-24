@@ -19,6 +19,7 @@ import time
 import queue
 import tempfile
 import threading
+import subprocess
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,6 +131,9 @@ class App(tk.Tk):
         self.wait_override_enabled = tk.BooleanVar(value=False)
         self.wait_override_seconds = tk.StringVar(value="0")
         self.repeat_file_enabled = tk.BooleanVar(value=False)
+        self.enable_outputs_on_start = tk.BooleanVar(value=True)
+        self.disable_outputs_on_finish = tk.BooleanVar(value=False)
+        self.shutdown_pc_on_finish = tk.BooleanVar(value=False)
 
         # Top-right label next to the progress bar (fixed width).
         # Shows only the estimated remaining time of the current run.
@@ -782,6 +786,7 @@ class App(tk.Tk):
                     fixed_wait_seconds=fixed_wait,
                     resume=resume_ck,
                     on_checkpoint=lambda ck: self.msgq.put(GuiMsg(MsgKind.CHECKPOINT, ck)),
+                    enable_outputs_on_start=bool(self.enable_outputs_on_start.get()),
                 )
                 self.msgq.put(GuiMsg(MsgKind.DONE, DonePayload(rc=int(rc))))
             except Exception as e:
@@ -989,6 +994,12 @@ class App(tk.Tk):
             self.wait_override_seconds.set(str(s.get("wait_override_seconds") or "0"))
         if isinstance(s.get("repeat_file_enabled"), bool):
             self.repeat_file_enabled.set(s["repeat_file_enabled"])
+        if isinstance(s.get("enable_outputs_on_start"), bool):
+            self.enable_outputs_on_start.set(s["enable_outputs_on_start"])
+        if isinstance(s.get("disable_outputs_on_finish"), bool):
+            self.disable_outputs_on_finish.set(s["disable_outputs_on_finish"])
+        if isinstance(s.get("shutdown_pc_on_finish"), bool):
+            self.shutdown_pc_on_finish.set(s["shutdown_pc_on_finish"])
 
         fp = s.get("file_path")
         if isinstance(fp, str) and fp and Path(fp).exists():
@@ -1027,6 +1038,9 @@ class App(tk.Tk):
             "wait_override_enabled": bool(self.wait_override_enabled.get()),
             "wait_override_seconds": self.wait_override_seconds.get(),
             "repeat_file_enabled": bool(self.repeat_file_enabled.get()),
+            "enable_outputs_on_start": bool(self.enable_outputs_on_start.get()),
+            "disable_outputs_on_finish": bool(self.disable_outputs_on_finish.get()),
+            "shutdown_pc_on_finish": bool(self.shutdown_pc_on_finish.get()),
             "language": self.lang,
         })
         save_settings(s)
@@ -1288,10 +1302,18 @@ class App(tk.Tk):
                         self.after(200, self._start)
                         continue
 
+                    # Optional post-finish actions apply only after a real, final completion.
+                    if rc == 0:
+                        try:
+                            self._handle_normal_finish_actions()
+                        except Exception:
+                            pass
+
                     # Reconnect after run so that status polling continues in idle.
+                    should_shutdown_pc = bool(self.shutdown_pc_on_finish.get()) and rc == 0
                     if self._reconnect_after_run:
                         self._reconnect_after_run = False
-                        if not self._connected:
+                        if (not should_shutdown_pc) and (not self._connected):
                             self._connect_selected_port_async()
 
                 elif kind == MsgKind.ERROR:
@@ -1621,6 +1643,56 @@ class App(tk.Tk):
                     except Exception:
                         pass
             self.msgq.put(GuiMsg(MsgKind.CONNECT_ERROR, {"error": str(last_err), "show_popup": (not silent)}))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_normal_finish_actions(self) -> None:
+        disable_outputs = bool(self.disable_outputs_on_finish.get())
+        shutdown_pc = bool(self.shutdown_pc_on_finish.get())
+        if not disable_outputs and not shutdown_pc:
+            return
+
+        def worker() -> None:
+            if disable_outputs:
+                port = self._extract_port_value(self.port_var.get())
+                if port:
+                    try:
+                        import jds6600
+                        fg = jds6600.JDS6600(port=port)
+                        fg.connect()
+                        try:
+                            fg.set_channels(channel1=False, channel2=False)
+                        finally:
+                            try:
+                                fg.close()
+                            except Exception:
+                                pass
+                        self.msgq.put(GuiMsg(MsgKind.LOG, self.tr("log_outputs_off_on_finish")))
+                    except Exception as e:
+                        self.msgq.put(GuiMsg(MsgKind.LOG, self.tr("log_outputs_off_failed", error=e)))
+            if shutdown_pc:
+                try:
+                    if sys.platform.startswith("win"):
+                        cmd = ["shutdown", "/s", "/t", "0"]
+                    elif sys.platform == "darwin":
+                        cmd = ["osascript", "-e", 'tell application "System Events" to shut down']
+                    elif sys.platform.startswith("linux"):
+                        try_cmds = [["shutdown", "-h", "now"], ["systemctl", "poweroff"]]
+                        last_err = None
+                        for cmd_try in try_cmds:
+                            try:
+                                subprocess.Popen(cmd_try)
+                                self.msgq.put(GuiMsg(MsgKind.LOG, self.tr("log_shutdown_pc_on_finish")))
+                                return
+                            except Exception as e:
+                                last_err = e
+                        raise RuntimeError(str(last_err) if last_err else self.tr("log_shutdown_pc_unsupported"))
+                    else:
+                        raise RuntimeError(self.tr("log_shutdown_pc_unsupported"))
+                    subprocess.Popen(cmd)
+                    self.msgq.put(GuiMsg(MsgKind.LOG, self.tr("log_shutdown_pc_on_finish")))
+                except Exception as e:
+                    self.msgq.put(GuiMsg(MsgKind.LOG, self.tr("log_shutdown_pc_failed", error=e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
