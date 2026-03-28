@@ -83,6 +83,8 @@ from .resume_store import ResumeStore
 from .messages import GuiMsg, MsgKind, ProgressPayload, DonePayload
 from .i18n import detect_language, tr as i18n_tr, translate_runtime_text
 from . import ui
+from .lcd import LcdPanel
+from .audio import TonePlayer
 
 
 PROJECT_GITHUB_URL = "https://github.com/JcJet/jds6600-controller"
@@ -134,6 +136,11 @@ class App(tk.Tk):
         self.enable_outputs_on_start = tk.BooleanVar(value=True)
         self.disable_outputs_on_finish = tk.BooleanVar(value=False)
         self.shutdown_pc_on_finish = tk.BooleanVar(value=False)
+        self.sound_on_finish = tk.BooleanVar(value=False)
+        self.dark_theme = tk.BooleanVar(value=bool((self._initial_settings or {}).get("dark_theme", False)))
+        self._tone_player = TonePlayer(self)
+        self._last_progress_done = 0
+        self._last_freq_cue = None
 
         # Top-right label next to the progress bar (fixed width).
         # Shows only the estimated remaining time of the current run.
@@ -144,6 +151,20 @@ class App(tk.Tk):
         self.progress_var = tk.DoubleVar(value=0.0)
 
         self.device_state_var = tk.StringVar(value=self.tr("device_state_none"))
+
+        # Friendly “now playing” / current-frequency panel.
+        self.current_primary_var = tk.StringVar(value="NO ACTIVE COMMAND")
+        self.current_secondary_var = tk.StringVar(value="PRESS START TO BEGIN")
+        self.current_time_var = tk.StringVar(value="--:--:--")
+        self.current_step_var = tk.StringVar(value="")
+        self.current_progress_var = tk.DoubleVar(value=0.0)
+        self._cp_kind: str = "idle"
+        self._cp_freq_hz: Optional[float] = None
+        self._cp_phase: str = ""
+        self._cp_total_s: float = 0.0
+        self._cp_base_rem_s: float = 0.0
+        self._cp_base_ts: float = 0.0
+        self._cp_infinite: bool = False
 
         # --- remaining-time countdown model (smooth UI updates) ---
         # We receive coarse estimates on step boundaries and richer checkpoints
@@ -156,6 +177,7 @@ class App(tk.Tk):
         self._rt_base_rem_s: float = 0.0
         self._rt_base_ts: float = 0.0
         self._rt_infinite: bool = False
+        self._progress_total_s: float = 0.0
 
         # --- device connection & status polling state ---
         # These attributes MUST exist before any auto-connect logic runs.
@@ -181,6 +203,8 @@ class App(tk.Tk):
         self._poll_error_throttle_sec = 5.0
 
         self._build_ui()
+        self._apply_theme()
+        self.bind_all("<KeyPress-space>", self._on_space_pause_resume, add=True)
         self._load_settings_and_init()
 
         self.after(100, self._drain_queue)
@@ -197,6 +221,109 @@ class App(tk.Tk):
 
     def tr(self, key: str, **kwargs) -> str:
         return i18n_tr(self.lang, key, **kwargs)
+
+    def _theme_palette(self) -> dict:
+        if bool(self.dark_theme.get()):
+            return {
+                "mode": "dark",
+                "bg": "#232629",
+                "panel": "#2b3035",
+                "panel_alt": "#31363b",
+                "fg": "#e6e6e6",
+                "muted_fg": "#c8c8c8",
+                "entry_bg": "#1b1e21",
+                "entry_fg": "#f3f3f3",
+                "text_bg": "#17191c",
+                "text_fg": "#f3f3f3",
+                "select_bg": "#40617f",
+                "select_fg": "#ffffff",
+                "border": "#4b4f55",
+                "accent": "#4d6f91",
+                "highlight": "#574617",
+                "led_bg": "#2b3035",
+            }
+        return {
+            "mode": "light",
+            "bg": "#f0f0f0",
+            "panel": "#f0f0f0",
+            "panel_alt": "#f7f7f7",
+            "fg": "#000000",
+            "muted_fg": "#333333",
+            "entry_bg": "#ffffff",
+            "entry_fg": "#000000",
+            "text_bg": "#ffffff",
+            "text_fg": "#000000",
+            "select_bg": "#cfe8ff",
+            "select_fg": "#000000",
+            "border": "#b7b7b7",
+            "accent": "#4f81bd",
+            "highlight": "#fff3c4",
+            "led_bg": "#f0f0f0",
+        }
+
+    def _apply_theme(self) -> None:
+        palette = self._theme_palette()
+        try:
+            self.configure(bg=palette["bg"])
+        except Exception:
+            pass
+        try:
+            style = ttk.Style(self)
+            try:
+                style.theme_use("clam")
+            except Exception:
+                pass
+            style.configure(".", background=palette["bg"], foreground=palette["fg"], fieldbackground=palette["entry_bg"])
+            style.configure("TFrame", background=palette["bg"])
+            style.configure("TLabel", background=palette["bg"], foreground=palette["fg"])
+            style.configure("TButton", background=palette["panel_alt"], foreground=palette["fg"], bordercolor=palette["border"])
+            style.map("TButton", background=[("active", palette["accent"]), ("disabled", palette["panel_alt"])], foreground=[("disabled", palette["muted_fg"])])
+            style.configure("Big.TButton", background=palette["panel_alt"], foreground=palette["fg"], bordercolor=palette["border"])
+            style.map("Big.TButton", background=[("active", palette["accent"]), ("disabled", palette["panel_alt"])], foreground=[("disabled", palette["muted_fg"])])
+            style.configure("TCheckbutton", background=palette["bg"], foreground=palette["fg"])
+            style.map("TCheckbutton", background=[("active", palette["bg"])], foreground=[("disabled", palette["muted_fg"])])
+            style.configure("TRadiobutton", background=palette["bg"], foreground=palette["fg"])
+            style.configure("TLabelframe", background=palette["bg"], foreground=palette["fg"], bordercolor=palette["border"])
+            style.configure("TLabelframe.Label", background=palette["bg"], foreground=palette["fg"])
+            style.configure("TEntry", fieldbackground=palette["entry_bg"], foreground=palette["entry_fg"], bordercolor=palette["border"])
+            style.configure("TCombobox", fieldbackground=palette["entry_bg"], foreground=palette["entry_fg"], background=palette["panel_alt"], arrowcolor=palette["fg"], bordercolor=palette["border"])
+            style.map("TCombobox", fieldbackground=[("readonly", palette["entry_bg"])], foreground=[("readonly", palette["entry_fg"])], selectbackground=[("readonly", palette["select_bg"])], selectforeground=[("readonly", palette["select_fg"])])
+            style.configure("Horizontal.TProgressbar", troughcolor=palette["panel_alt"], background=palette["accent"], bordercolor=palette["border"], lightcolor=palette["accent"], darkcolor=palette["accent"])
+            style.configure("TScrollbar", background=palette["panel_alt"], troughcolor=palette["bg"], bordercolor=palette["border"], arrowcolor=palette["fg"])
+            style.configure("TPanedwindow", background=palette["bg"])
+            style.configure("TSeparator", background=palette["border"])
+        except Exception:
+            pass
+
+        def walk(widget):
+            try:
+                if isinstance(widget, tk.Text):
+                    widget.configure(background=palette["text_bg"], foreground=palette["text_fg"], insertbackground=palette["text_fg"], selectbackground=palette["select_bg"], selectforeground=palette["select_fg"])
+                elif isinstance(widget, tk.Canvas):
+                    widget.configure(background=palette["led_bg"], highlightbackground=palette["border"])
+                elif isinstance(widget, tk.Menu):
+                    widget.configure(background=palette["panel_alt"], foreground=palette["fg"], activebackground=palette["accent"], activeforeground=palette["select_fg"], tearoff=False)
+                elif not isinstance(widget, ttk.Widget):
+                    widget.configure(background=palette["bg"], foreground=palette["fg"])
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                walk(child)
+
+        walk(self)
+        try:
+            self.editor.tag_configure("current_line", background=palette["highlight"])
+        except Exception:
+            pass
+        for menu in getattr(self, "_menus", []):
+            try:
+                menu.configure(background=palette["panel_alt"], foreground=palette["fg"], activebackground=palette["accent"], activeforeground=palette["select_fg"])
+            except Exception:
+                pass
+        self._persist_settings()
+
+    def _toggle_dark_theme(self) -> None:
+        self._apply_theme()
 
     def _change_language(self, lang: str) -> None:
         lang = detect_language(lang)
@@ -227,6 +354,7 @@ class App(tk.Tk):
             except Exception:
                 pass
         self._build_ui()
+        self._apply_theme()
         self._refresh_ports(do_probe=False)
         if current_port:
             self.port_var.set(current_port)
@@ -247,6 +375,8 @@ class App(tk.Tk):
         self.status_var.set(translate_runtime_text(prev_status, self.lang))
         self.device_var.set(translate_runtime_text(prev_device, self.lang))
         self.device_state_var.set(translate_runtime_text(prev_device_state, self.lang))
+        self._refresh_current_panel()
+        self._refresh_lcd_panel()
         if (not self._running) and (not self._connected):
             self.status_var.set(self.tr("status_not_connected"))
             self.device_state_var.set(self.tr("device_state_none"))
@@ -686,6 +816,7 @@ class App(tk.Tk):
         self.btn_stop.config(state="normal" if running else "disabled")
         if not running:
             self.btn_pause.config(text=self.tr("btn_pause"))
+            self._clear_current_panel()
 
     # ---------------- Run / resume helpers ----------------
 
@@ -735,6 +866,8 @@ class App(tk.Tk):
         self._rt_base_rem_s = 0.0
         self._rt_base_ts = 0.0
         self._rt_infinite = False
+        self._progress_total_s = 0.0
+        self._clear_current_panel()
 
         self._clear_highlight()
         self._set_running_ui(True)
@@ -878,6 +1011,14 @@ class App(tk.Tk):
                 else:
                     # going to resume: reset the base timestamp
                     self._rt_base_ts = now
+            if (not self._cp_infinite) and self._cp_base_ts:
+                now2 = time.monotonic()
+                if not was_paused:
+                    delta2 = max(0.0, float(now2 - self._cp_base_ts))
+                    self._cp_base_rem_s = max(0.0, float(self._cp_base_rem_s) - delta2)
+                    self._cp_base_ts = now2
+                else:
+                    self._cp_base_ts = now2
         except Exception:
             pass
 
@@ -964,6 +1105,316 @@ class App(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _format_freq_label(self, freq_hz: Optional[float]) -> str:
+        if freq_hz is None:
+            return "--"
+        try:
+            v = float(freq_hz)
+        except Exception:
+            return "--"
+        if abs(v - round(v)) < 1e-9:
+            return f"{int(round(v))} Hz"
+        if abs(v) >= 1000:
+            return f"{v:,.2f} Hz".replace(",", " ")
+        return f"{v:.2f} Hz"
+
+    def _set_current_step_badge(self, current: Optional[int], total: Optional[int]) -> None:
+        try:
+            cur = int(current) if current is not None else 0
+            tot = int(total) if total is not None else 0
+        except Exception:
+            cur = 0
+            tot = 0
+        if cur > 0 and tot > 0:
+            self.current_step_var.set(f"STEP {cur}/{tot}")
+        else:
+            self.current_step_var.set("")
+        self._refresh_lcd_panel()
+
+    def _refresh_lcd_panel(self) -> None:
+        try:
+            if hasattr(self, "lcd_panel") and self.lcd_panel is not None:
+                self.lcd_panel.set_state(
+                    primary=self.current_primary_var.get(),
+                    secondary=self.current_secondary_var.get(),
+                    time_text=self.current_time_var.get(),
+                    step_text=self.current_step_var.get(),
+                    progress=float(self.current_progress_var.get()),
+                )
+        except Exception:
+            pass
+
+    def _maybe_play_freq_cue(self, *, kind: str, freq_hz: Optional[float], phase: str = "", cue_key=None) -> None:
+        if not bool(self.sound_on_finish.get()):
+            return
+        if (not self._running) or bool(getattr(self.state, "paused", False)):
+            return
+        if kind == "cycle" and str(phase or "").strip().lower() == "off":
+            return
+        if kind not in {"freq", "cycle"}:
+            return
+        if freq_hz is None:
+            return
+        try:
+            key = cue_key if cue_key is not None else (kind, round(float(freq_hz), 6), str(phase or "").strip().lower())
+        except Exception:
+            return
+        if key == self._last_freq_cue:
+            return
+        self._last_freq_cue = key
+        try:
+            self._tone_player.play("freq_change")
+        except Exception:
+            pass
+
+    def _set_current_panel_state(
+        self,
+        *,
+        kind: str,
+        freq_hz: Optional[float] = None,
+        phase: str = "",
+        total_s: float = 0.0,
+        rem_s: float = 0.0,
+        infinite: bool = False,
+        reset_ts: bool = True,
+    ) -> None:
+        self._cp_kind = str(kind or "idle")
+        self._cp_freq_hz = freq_hz if freq_hz is None else float(freq_hz)
+        self._cp_phase = str(phase or "")
+        self._cp_infinite = bool(infinite)
+        self._cp_total_s = max(0.0, float(total_s or 0.0))
+        self._cp_base_rem_s = max(0.0, float(rem_s or 0.0))
+        if reset_ts:
+            self._cp_base_ts = time.monotonic()
+        self._refresh_current_panel()
+
+    def _refresh_current_panel(self) -> None:
+        kind = self._cp_kind
+        phase = (self._cp_phase or "").strip().lower()
+        freq_text = self._format_freq_label(self._cp_freq_hz).upper()
+
+        if kind == "wait":
+            primary = "WAIT"
+            secondary = "WAITING FOR NEXT COMMAND"
+        elif kind == "freq":
+            primary = freq_text
+            secondary = "FIXED FREQUENCY"
+        elif kind == "cycle":
+            primary = freq_text if self._cp_freq_hz is not None else "CYCLE"
+            if phase == "off":
+                secondary = "CYCLE  •  PAUSE"
+            elif phase == "on":
+                secondary = "CYCLE  •  HOLD"
+            else:
+                secondary = "CYCLE  •  ACTIVE"
+        elif kind == "mod":
+            primary = freq_text if self._cp_freq_hz is not None else "FM MODULATION"
+            if phase == "fall":
+                secondary = "FM  •  FALL"
+            elif phase == "rise":
+                secondary = "FM  •  RISE"
+            else:
+                secondary = "FM  •  ACTIVE"
+        else:
+            primary = "NO ACTIVE COMMAND"
+            secondary = "PRESS START TO BEGIN"
+
+        self.current_primary_var.set(primary)
+        self.current_secondary_var.set(secondary)
+        if self._cp_infinite:
+            self.current_time_var.set("∞")
+            self.current_progress_var.set(0.0)
+            self._refresh_lcd_panel()
+            return
+        if self._cp_total_s > 0.0:
+            rem = max(0.0, float(self._cp_base_rem_s))
+            self.current_time_var.set(fmt_hhmmss(rem))
+            pct = max(0.0, min(100.0, (1.0 - (rem / self._cp_total_s)) * 100.0))
+            self.current_progress_var.set(pct)
+        else:
+            self.current_time_var.set("--:--:--")
+            self.current_progress_var.set(0.0)
+        self._refresh_lcd_panel()
+
+    def _current_panel_from_step_start(self, step, *, step_index: Optional[int] = None, total_steps: Optional[int] = None) -> None:
+        self._set_current_step_badge((step_index + 1) if step_index is not None else None, total_steps)
+        if isinstance(step, WaitStep):
+            total = float(estimate_step_duration(step, fixed_wait=self._run_fixed_wait))
+            self._set_current_panel_state(kind="wait", total_s=total, rem_s=total)
+        elif isinstance(step, CycleStep):
+            self._set_current_panel_state(kind="cycle", freq_hz=None, phase="", total_s=0.0, rem_s=0.0)
+        elif isinstance(step, ModStep):
+            total = max(0.0, float(getattr(step, "time_s", 0.0)))
+            self._set_current_panel_state(kind="mod", freq_hz=None, phase="", total_s=total, rem_s=total)
+        elif hasattr(step, "hz"):
+            hz = getattr(step, "hz", None)
+            self._set_current_panel_state(kind="freq", freq_hz=float(hz) if hz is not None else None, total_s=0.0, rem_s=0.0)
+            try:
+                self._maybe_play_freq_cue(kind="freq", freq_hz=float(hz) if hz is not None else None, cue_key=("freq", step_index))
+            except Exception:
+                pass
+        else:
+            self._clear_current_panel()
+
+    def _apply_current_panel_checkpoint(self, ck: dict) -> None:
+        if not isinstance(ck, dict):
+            return
+        if self._run_steps is None:
+            return
+        try:
+            step_index = int(ck.get("step_index", 0))
+        except Exception:
+            return
+        if step_index < 0 or step_index >= len(self._run_steps):
+            return
+        self._set_current_step_badge(step_index + 1, len(self._run_steps))
+        step = self._run_steps[step_index]
+        within = ck.get("within") if isinstance(ck.get("within"), dict) else None
+        if not within:
+            self._current_panel_from_step_start(step, step_index=step_index, total_steps=len(self._run_steps))
+            return
+        now = time.monotonic()
+        if isinstance(step, WaitStep) and within.get("kind") == "wait":
+            total = float(estimate_step_duration(step, fixed_wait=self._run_fixed_wait))
+            rem = max(0.0, float(within.get("remaining", total)))
+            self._cp_base_ts = now
+            self._set_current_panel_state(kind="wait", total_s=total, rem_s=rem, reset_ts=False)
+            return
+        if isinstance(step, CycleStep) and within.get("kind") in {"cycle", "cycle_wait"}:
+            def _eff_wait_local(w):
+                if w is None:
+                    return 0.0
+                try:
+                    wv = float(w)
+                except Exception:
+                    return 0.0
+                if wv <= 0.0:
+                    return 0.0
+                if self._run_fixed_wait is not None:
+                    try:
+                        return max(0.0, float(self._run_fixed_wait))
+                    except Exception:
+                        return max(0.0, wv)
+                return max(0.0, wv)
+            on_s = _eff_wait_local(getattr(step, "on_wait", 0.0))
+            off_s = _eff_wait_local(getattr(step, "off_wait", None)) if getattr(step, "off_wait", None) is not None else 0.0
+            kind = str(within.get("kind", ""))
+            phase = str(within.get("phase", "on" if kind == "cycle" else "")).strip().lower() or ("on" if kind == "cycle" else "")
+            freq_hz = within.get("freq_hz")
+            try:
+                freq_hz = None if freq_hz is None else float(freq_hz)
+            except Exception:
+                freq_hz = None
+            if kind == "cycle_wait":
+                try:
+                    rem_phase = max(0.0, float(within.get("remaining", 0.0)))
+                except Exception:
+                    rem_phase = 0.0
+                rem = rem_phase + (off_s if phase == "on" else 0.0)
+            else:
+                rem = on_s + off_s
+            total = max(0.0, on_s + off_s)
+            self._cp_base_ts = now
+            self._set_current_panel_state(kind="cycle", freq_hz=freq_hz, phase=phase, total_s=total, rem_s=rem, reset_ts=False)
+            cue_key = ("cycle", step_index, within.get("item_i"), within.get("sub_k"), phase)
+            self._maybe_play_freq_cue(kind="cycle", freq_hz=freq_hz, phase=phase, cue_key=cue_key)
+            return
+        if isinstance(step, ModStep) and within.get("kind") == "mod":
+            total = max(0.0, float(getattr(step, "time_s", 0.0)))
+            try:
+                k = int(within.get("k", 0))
+            except Exception:
+                k = 0
+            try:
+                updates = int(within.get("updates", 1))
+            except Exception:
+                updates = 1
+            if updates <= 0:
+                updates = 1
+            frac = max(0.0, min(1.0, k / float(updates)))
+            rem = total * (1.0 - frac)
+            inf = False
+            freq_hz = within.get("freq_hz")
+            try:
+                freq_hz = None if freq_hz is None else float(freq_hz)
+            except Exception:
+                freq_hz = None
+            self._cp_base_ts = now
+            self._set_current_panel_state(kind="mod", freq_hz=freq_hz, phase=str(within.get("leg", "")), total_s=total, rem_s=rem, infinite=inf, reset_ts=False)
+            return
+        self._current_panel_from_step_start(step, step_index=step_index, total_steps=len(self._run_steps))
+
+    def _clear_current_panel(self) -> None:
+        self._set_current_panel_state(kind="idle", freq_hz=None, total_s=0.0, rem_s=0.0)
+        self._last_freq_cue = None
+        self._set_current_step_badge(None, None)
+
+    def _play_finish_sound(self, event: str = "file_done") -> None:
+        try:
+            self._tone_player.play(event)
+        except Exception:
+            try:
+                self.bell()
+            except Exception:
+                pass
+
+    def _on_sound_toggle(self) -> None:
+        try:
+            enabled = bool(self.sound_on_finish.get())
+        except Exception:
+            enabled = False
+        if not enabled:
+            return
+        try:
+            started = bool(self._tone_player.play("sound_test"))
+            if not started:
+                try:
+                    self._log("Sound test: skipped")
+                except Exception:
+                    pass
+                return
+
+            def _report_backend() -> None:
+                try:
+                    backend = self._tone_player.last_backend
+                    if getattr(self._tone_player, "running_under_sudo", False):
+                        self._log(f"Sound test: {backend} (launched under sudo)")
+                    else:
+                        self._log(f"Sound test: {backend}")
+                except Exception:
+                    pass
+
+            try:
+                self.after(250, _report_backend)
+            except Exception:
+                _report_backend()
+        except Exception:
+            try:
+                self.bell()
+                try:
+                    self._log("Sound test: tk-bell fallback")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _on_space_pause_resume(self, event=None):
+        if not self._running:
+            return None
+        widget = None
+        try:
+            widget = self.focus_get()
+        except Exception:
+            widget = None
+        text_classes = {"Text", "Entry", "TEntry", "Spinbox", "TCombobox", "Combobox"}
+        try:
+            if widget is not None and widget.winfo_class() in text_classes:
+                return None
+        except Exception:
+            pass
+        self._toggle_pause()
+        return "break"
+
     def _highlight_source_line(self, source_line: int):
         # source_line is from CSV file; our Text widget line numbers start at 1
         self._clear_highlight()
@@ -1000,6 +1451,11 @@ class App(tk.Tk):
             self.disable_outputs_on_finish.set(s["disable_outputs_on_finish"])
         if isinstance(s.get("shutdown_pc_on_finish"), bool):
             self.shutdown_pc_on_finish.set(s["shutdown_pc_on_finish"])
+        if isinstance(s.get("sound_on_finish"), bool):
+            self.sound_on_finish.set(s["sound_on_finish"])
+        if isinstance(s.get("dark_theme"), bool):
+            self.dark_theme.set(s["dark_theme"])
+        self._apply_theme()
 
         fp = s.get("file_path")
         if isinstance(fp, str) and fp and Path(fp).exists():
@@ -1041,6 +1497,8 @@ class App(tk.Tk):
             "enable_outputs_on_start": bool(self.enable_outputs_on_start.get()),
             "disable_outputs_on_finish": bool(self.disable_outputs_on_finish.get()),
             "shutdown_pc_on_finish": bool(self.shutdown_pc_on_finish.get()),
+            "sound_on_finish": bool(self.sound_on_finish.get()),
+            "dark_theme": bool(self.dark_theme.get()),
             "language": self.lang,
         })
         save_settings(s)
@@ -1215,6 +1673,7 @@ class App(tk.Tk):
                     # Update smooth remaining-time model during long steps.
                     if isinstance(payload, dict):
                         self._remaining_apply_checkpoint(payload)
+                        self._apply_current_panel_checkpoint(payload)
 
                 elif kind == MsgKind.LOG:
                     self._log(translate_runtime_text(str(payload), self.lang))
@@ -1242,14 +1701,40 @@ class App(tk.Tk):
                             est = float(data.get('est', 0.0) or 0.0)
                     except Exception:
                         pass
-                    if total > 0:
-                        pct = min(100.0, (done / total) * 100.0)
-                        self.progress_var.set(pct)
                     if isinstance(line, int):
                         self._highlight_source_line(line)
+                    try:
+                        if bool(self.sound_on_finish.get()) and self._last_progress_done > 0 and int(done) > int(self._last_progress_done):
+                            self.after(0, lambda: self._play_finish_sound("command_done"))
+                        self._last_progress_done = max(int(done), int(self._last_progress_done))
+                    except Exception:
+                        pass
+                    try:
+                        idx = max(0, int(done) - 1)
+                        if self._run_steps is not None and 0 <= idx < len(self._run_steps):
+                            self._current_panel_from_step_start(self._run_steps[idx], step_index=idx, total_steps=len(self._run_steps))
+                    except Exception:
+                        pass
                     if total > 0:
                         # Set countdown base estimate (the timer will update smoothly).
                         self._remaining_set_from_estimate(est)
+                    try:
+                        import math
+                        if math.isfinite(float(est)) and float(est) >= 0.0:
+                            if self._progress_total_s <= 0.0:
+                                self._progress_total_s = max(0.0, float(est))
+                            if self._progress_total_s > 0.0:
+                                pct = max(0.0, min(100.0, (1.0 - (float(est) / float(self._progress_total_s))) * 100.0))
+                                self.progress_var.set(pct)
+                            elif total > 0:
+                                self.progress_var.set(0.0)
+                        elif total > 0:
+                            pct = min(100.0, (done / total) * 100.0)
+                            self.progress_var.set(pct)
+                    except Exception:
+                        if total > 0:
+                            pct = min(100.0, (done / total) * 100.0)
+                            self.progress_var.set(pct)
 
                 elif kind == MsgKind.DONE:
                     rc = 0
@@ -1270,6 +1755,7 @@ class App(tk.Tk):
                     self.status_var.set(self.tr("status_stopped") if rc == 4 else self.tr("status_done"))
                     self._set_running_ui(False)
                     self._clear_highlight()
+                    self._clear_current_panel()
 
                     # Completed or stopped: clear persisted resume point (no longer relevant).
                     try:
@@ -1308,6 +1794,11 @@ class App(tk.Tk):
                             self._handle_normal_finish_actions()
                         except Exception:
                             pass
+                        if bool(self.sound_on_finish.get()):
+                            try:
+                                self.after(0, lambda: self._play_finish_sound("file_done"))
+                            except Exception:
+                                pass
 
                     # Reconnect after run so that status polling continues in idle.
                     should_shutdown_pc = bool(self.shutdown_pc_on_finish.get()) and rc == 0
@@ -1357,6 +1848,8 @@ class App(tk.Tk):
         except Exception:
             self._rt_base_rem_s = 0.0
         self._rt_base_ts = now
+        if self._progress_total_s <= 0.0 and self._rt_base_rem_s > 0.0:
+            self._progress_total_s = float(self._rt_base_rem_s)
         self.remaining_time_var.set(fmt_hhmmss(self._rt_base_rem_s))
 
     def _remaining_apply_checkpoint(self, ck: dict) -> None:
@@ -1568,6 +2061,24 @@ class App(tk.Tk):
                         cur = max(0.0, float(self._rt_base_rem_s) - float(delta))
                         total = cur + max(0.0, float(self._rt_tail_s))
                         self.remaining_time_var.set(fmt_hhmmss(total))
+                        try:
+                            import math
+                            if self._progress_total_s > 0.0 and math.isfinite(float(total)):
+                                pct = max(0.0, min(100.0, (1.0 - (float(total) / float(self._progress_total_s))) * 100.0))
+                                self.progress_var.set(pct)
+                        except Exception:
+                            pass
+                if self._cp_infinite:
+                    self.current_time_var.set("∞")
+                    self.current_progress_var.set(0.0)
+                elif self._cp_total_s > 0.0 and self._cp_base_ts:
+                    now2 = time.monotonic()
+                    delta2 = 0.0 if bool(getattr(self.state, "paused", False)) else (now2 - self._cp_base_ts)
+                    rem2 = max(0.0, float(self._cp_base_rem_s) - float(delta2))
+                    self.current_time_var.set(fmt_hhmmss(rem2))
+                    pct2 = max(0.0, min(100.0, (1.0 - (rem2 / self._cp_total_s)) * 100.0))
+                    self.current_progress_var.set(pct2)
+                self._refresh_lcd_panel()
         finally:
             self.after(200, self._tick_remaining_time)
 
@@ -1658,15 +2169,45 @@ class App(tk.Tk):
                 if port:
                     try:
                         import jds6600
-                        fg = jds6600.JDS6600(port=port)
-                        fg.connect()
-                        try:
-                            fg.set_channels(channel1=False, channel2=False)
-                        finally:
+                        done = False
+
+                        # First, try the existing GUI connection if it is already alive.
+                        with self._fg_lock:
+                            fg_existing = self._fg
+                        if fg_existing is not None:
                             try:
-                                fg.close()
+                                fg_existing.set_channels(channel1=False, channel2=False)
+                                done = True
                             except Exception:
-                                pass
+                                done = False
+
+                        # If the port is still being released by the runner, wait a bit and retry.
+                        if not done:
+                            last_err = None
+                            for _ in range(12):
+                                fg = None
+                                try:
+                                    with self._io_lock:
+                                        fg = jds6600.JDS6600(port=port)
+                                        fg.connect()
+                                        fg.set_channels(channel1=False, channel2=False)
+                                    done = True
+                                    break
+                                except Exception as e:
+                                    last_err = e
+                                    try:
+                                        time.sleep(0.25)
+                                    except Exception:
+                                        pass
+                                finally:
+                                    if fg is not None:
+                                        try:
+                                            fg.close()
+                                        except Exception:
+                                            pass
+                            if not done and last_err is not None:
+                                raise last_err
+
                         self.msgq.put(GuiMsg(MsgKind.LOG, self.tr("log_outputs_off_on_finish")))
                     except Exception as e:
                         self.msgq.put(GuiMsg(MsgKind.LOG, self.tr("log_outputs_off_failed", error=e)))

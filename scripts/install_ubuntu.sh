@@ -6,10 +6,10 @@ echo "== JDS6600 Controller installer (Ubuntu/Debian) =="
 # 1) System deps
 if command -v apt >/dev/null 2>&1; then
   sudo apt update
-  sudo apt install -y python3 python3-venv python3-pip python3-tk
+  sudo apt install -y python3 python3-venv python3-pip python3-tk python3-dev build-essential libasound2-dev alsa-utils pulseaudio-utils ffmpeg gstreamer1.0-tools libcanberra-gtk3-module
 else
   echo "This installer currently supports apt-based systems (Ubuntu/Debian)."
-  echo "Please install: python3, python3-venv, python3-pip, python3-tk"
+  echo "Please install: python3, python3-venv, python3-pip, python3-tk, python3-dev, build-essential, libasound2-dev, alsa-utils, pulseaudio-utils, ffmpeg, gstreamer1.0-tools, libcanberra-gtk3-module"
 fi
 
 # 2) venv + deps

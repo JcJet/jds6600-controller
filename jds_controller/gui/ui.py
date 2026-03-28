@@ -3,24 +3,32 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+from .lcd import LcdPanel
+
 
 def build_ui(app, *, github_url: str, telegram_url: str) -> None:
     """Build all Tk widgets for the main window."""
     t = app.tr
     pad = {"padx": 8, "pady": 6}
 
+    now_label_kwargs = {}
     try:
         import tkinter.font as tkfont
         style = ttk.Style(app)
         big_font = tkfont.nametofont("TkDefaultFont").copy()
         big_font.configure(size=max(12, big_font.cget("size") + 4), weight="bold")
         style.configure("Big.TButton", font=big_font, padding=(18, 10))
+        now_font = tkfont.nametofont("TkDefaultFont").copy()
+        now_font.configure(size=max(11, now_font.cget("size") + 2), weight="bold")
+        now_label_kwargs = {"font": now_font}
     except Exception:
         pass
 
     menubar = tk.Menu(app)
+    app._menus = []
 
     filemenu = tk.Menu(menubar, tearoff=False)
+    app._menus.append(filemenu)
     filemenu.add_command(label=t("menu_open"), command=app._browse_open)
     filemenu.add_command(label=t("menu_save"), command=app._save)
     filemenu.add_command(label=t("menu_save_as"), command=app._save_as)
@@ -31,6 +39,7 @@ def build_ui(app, *, github_url: str, telegram_url: str) -> None:
     menubar.add_cascade(label=t("menu_file"), menu=filemenu)
 
     runmenu = tk.Menu(menubar, tearoff=False)
+    app._menus.append(runmenu)
     runmenu.add_command(label=t("menu_start"), command=app._start)
     runmenu.add_command(label=t("menu_pause_resume"), command=app._toggle_pause)
     runmenu.add_command(label=t("menu_next_command"), command=app._next_command)
@@ -39,22 +48,31 @@ def build_ui(app, *, github_url: str, telegram_url: str) -> None:
     runmenu.add_checkbutton(label=t("menu_enable_outputs_on_start"), variable=app.enable_outputs_on_start)
     runmenu.add_checkbutton(label=t("menu_disable_outputs_on_finish"), variable=app.disable_outputs_on_finish)
     runmenu.add_checkbutton(label=t("menu_shutdown_pc_on_finish"), variable=app.shutdown_pc_on_finish)
+    runmenu.add_checkbutton(label=t("menu_sound_on_finish"), variable=app.sound_on_finish, command=app._on_sound_toggle)
     runmenu.add_separator()
     runmenu.add_command(label=t("menu_validate"), command=app._validate)
     menubar.add_cascade(label=t("menu_run"), menu=runmenu)
 
+    viewmenu = tk.Menu(menubar, tearoff=False)
+    app._menus.append(viewmenu)
+    viewmenu.add_checkbutton(label=t("menu_dark_theme"), variable=app.dark_theme, command=app._toggle_dark_theme)
+    menubar.add_cascade(label=t("menu_view"), menu=viewmenu)
+
     langmenu = tk.Menu(menubar, tearoff=False)
+    app._menus.append(langmenu)
     langmenu.add_radiobutton(label=t("lang_ru"), value="ru", variable=app.lang_var, command=lambda: app._change_language("ru"))
     langmenu.add_radiobutton(label=t("lang_en"), value="en", variable=app.lang_var, command=lambda: app._change_language("en"))
     menubar.add_cascade(label=t("menu_language"), menu=langmenu)
 
     helpmenu = tk.Menu(menubar, tearoff=False)
+    app._menus.append(helpmenu)
     helpmenu.add_command(label=t("menu_quick_help"), command=app._show_help)
     helpmenu.add_command(label=t("menu_github"), command=lambda: app._open_url(github_url))
     helpmenu.add_separator()
     helpmenu.add_command(label=t("menu_about"), command=app._about)
     menubar.add_cascade(label=t("menu_help"), menu=helpmenu)
 
+    app._menus.insert(0, menubar)
     app.config(menu=menubar)
     app.bind("<F1>", lambda e: app._show_help())
 
@@ -127,10 +145,19 @@ def build_ui(app, *, github_url: str, telegram_url: str) -> None:
     frm_status = ttk.Frame(app)
     frm_status.pack(fill="x", **pad)
 
-    app.pb = ttk.Progressbar(frm_status, mode="determinate", maximum=100.0, variable=app.progress_var)
+    frm_status_top = ttk.Frame(frm_status)
+    frm_status_top.pack(fill="x")
+
+    app.pb = ttk.Progressbar(frm_status_top, mode="determinate", maximum=100.0, variable=app.progress_var)
     app.pb.pack(fill="x", expand=True, side="left", padx=(0, 10))
 
-    ttk.Label(frm_status, textvariable=app.remaining_time_var, width=10, anchor="e").pack(side="right")
+    ttk.Label(frm_status_top, textvariable=app.remaining_time_var, width=10, anchor="e").pack(side="right")
+
+    frm_now = ttk.LabelFrame(frm_status, text=t("group_now_playing"))
+    frm_now.pack(fill="x", pady=(6, 0))
+
+    app.lcd_panel = LcdPanel(frm_now, height=112)
+    app.lcd_panel.pack(fill="x", padx=8, pady=8)
 
     frm_mid = ttk.PanedWindow(app, orient="horizontal")
     frm_mid.pack(fill="both", expand=True, **pad)

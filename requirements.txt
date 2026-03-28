@@ -1,2 +1,5 @@
 jds6600>=0.6.0
 pyserial>=3.5
+
+Pillow>=10,<12
+simpleaudio>=1.0.4

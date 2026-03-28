@@ -9,6 +9,8 @@ datas = [
     (str(project_dir / "commands.csv"), "."),
     (str(project_dir / "commands.example.csv"), "."),
     (str(project_dir / "README.md"), "."),
+    (str(project_dir / "assets" / "fonts" / "DSEG14Classic-Regular.ttf"), "assets/fonts"),
+    (str(project_dir / "assets" / "fonts" / "DSEG-LICENSE.txt"), "assets/fonts"),
 ]
 
 # include icon if present (optional)
@@ -26,7 +28,7 @@ a = Analysis(
     pathex=[str(project_dir)],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=["simpleaudio"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

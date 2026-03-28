@@ -140,13 +140,20 @@ def _set_frequency_and_adaptive_voltage(
     channels: Sequence[int],
     freq_hz: float,
     adaptive_voltage: bool,
+    on_set_frequency: Optional[Callable[[int, float], None]] = None,
 ) -> Optional[float]:
     """Set frequency on all channels and optionally apply adaptive voltage.
 
     Returns the applied voltage (V) when adaptive_voltage=True, otherwise None.
     """
     for ch in channels:
-        fg.set_frequency(channel=ch, value=float(freq_hz))
+        hz = float(freq_hz)
+        fg.set_frequency(channel=ch, value=hz)
+        if on_set_frequency is not None:
+            try:
+                on_set_frequency(int(ch), hz)
+            except Exception:
+                pass
     if adaptive_voltage:
         v = _voltage_by_freq(float(freq_hz))
         for ch in channels:
@@ -337,6 +344,58 @@ def run_sequence(
     def is_skip() -> bool:
         return bool(getattr(state, 'skip_wait', False))
 
+    active_freqs: Dict[int, float] = {}
+    pause_restore_freqs: Dict[int, float] = {}
+    pause_output_applied = False
+    last_pause_seen = bool(state.paused)
+
+    def _track_frequency(channel: int, hz: float) -> None:
+        try:
+            active_freqs[int(channel)] = float(hz)
+        except Exception:
+            pass
+
+    def _set_channel_frequency(channel: int, hz: float) -> None:
+        fg.set_frequency(channel=int(channel), value=float(hz))
+        _track_frequency(int(channel), float(hz))
+
+    def _apply_pause_output_zero() -> None:
+        nonlocal pause_output_applied, pause_restore_freqs
+        if dry_run or fg is None or pause_output_applied:
+            return
+        if not active_freqs:
+            return
+        pause_restore_freqs = {int(ch): float(hz) for ch, hz in active_freqs.items()}
+        for ch in sorted(pause_restore_freqs):
+            try:
+                fg.set_frequency(channel=int(ch), value=0.0)
+            except Exception:
+                pass
+        pause_output_applied = True
+
+    def _restore_pause_output() -> None:
+        nonlocal pause_output_applied, pause_restore_freqs
+        if dry_run or fg is None or not pause_output_applied:
+            return
+        for ch, hz in list(pause_restore_freqs.items()):
+            try:
+                _set_channel_frequency(int(ch), float(hz))
+            except Exception:
+                pass
+        pause_restore_freqs = {}
+        pause_output_applied = False
+
+    def _sync_pause_output() -> bool:
+        nonlocal last_pause_seen
+        paused_now = bool(state.paused)
+        if paused_now != last_pause_seen:
+            if paused_now:
+                _apply_pause_output_zero()
+            else:
+                _restore_pause_output()
+            last_pause_seen = paused_now
+        return paused_now
+
     fg = None
     mod_both_warning_sent = False
     try:
@@ -363,6 +422,8 @@ def run_sequence(
             # checkpoint at step boundary
             _set_checkpoint(i, step, None)
 
+            _sync_pause_output()
+
             if state.stopped:
                 status("Stopped.")
                 try:
@@ -378,7 +439,7 @@ def run_sequence(
             # While paused, still poll device state periodically so GUI can display
             # real parameters (important for startup auto-resume which enters paused state).
             _pause_poll_last = 0.0
-            while state.paused and not state.stopped:
+            while _sync_pause_output() and not state.stopped:
                 if (not dry_run) and fg is not None and on_device_state is not None:
                     now = time.monotonic()
                     if (not _pause_poll_last) or (now - _pause_poll_last) >= float(state_poll_interval or 1.0):
@@ -424,11 +485,11 @@ def run_sequence(
                 if per_ch:
                     for ch, st in per_ch.items():
                         hz = float(st.pop("frequency", step.hz))
-                        fg.set_frequency(channel=ch, value=hz)
+                        _set_channel_frequency(ch, hz)
                         _apply_channel_settings(fg, ch, st)
                 else:
                     for ch in chs:
-                        fg.set_frequency(channel=ch, value=float(step.hz))
+                        _set_channel_frequency(ch, float(step.hz))
                         _apply_channel_settings(fg, ch, opts)
 
 
@@ -511,7 +572,7 @@ def run_sequence(
 
                 skip_cycle_element = False
 
-                def _cycle_sleep(phase: str, seconds: float, *, item_i: int, sub_k: int, sub_n: int, override_remaining: Optional[float] = None) -> None:
+                def _cycle_sleep(phase: str, seconds: float, *, item_i: int, sub_k: int, sub_n: int, freq_hz: float, override_remaining: Optional[float] = None) -> None:
                     nonlocal _last_state_poll
                     eff = float(seconds)
                     if override_remaining is not None:
@@ -536,6 +597,7 @@ def run_sequence(
                             "item_i": int(item_i),
                             "sub_k": int(sub_k),
                             "sub_n": int(sub_n),
+                            "freq_hz": float(freq_hz),
                             "remaining": float(rem),
                         })
                         if on_device_state is None:
@@ -551,7 +613,7 @@ def run_sequence(
 
                     sleep_with_control(
                         eff,
-                        is_paused=is_paused,
+                        is_paused=_sync_pause_output,
                         is_stopped=is_stopped,
                         is_skip=is_skip,
                         on_tick=on_tick,
@@ -565,6 +627,7 @@ def run_sequence(
                 def _set_freq(freq_hz: float, *, item_i: int, sub_k: int, sub_n: int) -> None:
                     _set_checkpoint(i, step, {
                         "kind": "cycle",
+                        "phase": "on",
                         "item_i": int(item_i),
                         "sub_k": int(sub_k),
                         "sub_n": int(sub_n),
@@ -575,6 +638,7 @@ def run_sequence(
                         channels=cycle_channels,
                         freq_hz=float(freq_hz),
                         adaptive_voltage=bool(getattr(step, 'adaptive_voltage', False)),
+                        on_set_frequency=_track_frequency,
                     )
 
                 # Effective waits (fixed-wait override applies to actual waits only when wait>0).
@@ -625,7 +689,7 @@ def run_sequence(
 
                             # on-wait
                             if on_s > 0.0 and phase != "off":
-                                _cycle_sleep("on", on_s, item_i=item_i, sub_k=sub_k, sub_n=sub_n, override_remaining=rem if phase == "on" else None)
+                                _cycle_sleep("on", on_s, item_i=item_i, sub_k=sub_k, sub_n=sub_n, freq_hz=float(freq), override_remaining=rem if phase == "on" else None)
                             if skip_cycle_element:
                                 skip_cycle_element = False
                                 break
@@ -634,8 +698,8 @@ def run_sequence(
                             if off_s > 0.0:
                                 # If resuming from "on" phase, off wait is full; if resuming from "off", use remaining override
                                 for ch in cycle_channels:
-                                    fg.set_frequency(channel=ch, value=float(pause_hz))
-                                _cycle_sleep("off", off_s, item_i=item_i, sub_k=sub_k, sub_n=sub_n, override_remaining=rem if phase == "off" else None)
+                                    _set_channel_frequency(ch, float(pause_hz))
+                                _cycle_sleep("off", off_s, item_i=item_i, sub_k=sub_k, sub_n=sub_n, freq_hz=float(pause_hz), override_remaining=rem if phase == "off" else None)
                             if skip_cycle_element:
                                 skip_cycle_element = False
                                 break
@@ -668,14 +732,14 @@ def run_sequence(
                         rem = resume_remaining if (phase and resume_remaining is not None and item_i == start_item_i) else None
 
                         if on_s > 0.0 and phase != "off":
-                            _cycle_sleep("on", on_s, item_i=item_i, sub_k=0, sub_n=sub_n, override_remaining=rem if phase == "on" else None)
+                            _cycle_sleep("on", on_s, item_i=item_i, sub_k=0, sub_n=sub_n, freq_hz=float(freq), override_remaining=rem if phase == "on" else None)
                         if skip_cycle_element:
                             skip_cycle_element = False
                             continue
                         if off_s > 0.0:
                             for ch in cycle_channels:
                                 fg.set_frequency(channel=ch, value=float(pause_hz))
-                            _cycle_sleep("off", off_s, item_i=item_i, sub_k=0, sub_n=sub_n, override_remaining=rem if phase == "off" else None)
+                            _cycle_sleep("off", off_s, item_i=item_i, sub_k=0, sub_n=sub_n, freq_hz=float(pause_hz), override_remaining=rem if phase == "off" else None)
                         if skip_cycle_element:
                             skip_cycle_element = False
                             continue
@@ -802,6 +866,7 @@ def run_sequence(
                         channels=sweep_channels,
                         freq_hz=float(freq_hz),
                         adaptive_voltage=bool(step.adaptive_voltage),
+                        on_set_frequency=_track_frequency,
                     )
                     _emit_mod_status(float(freq_hz), float(v) if v is not None else None)
 
@@ -869,13 +934,14 @@ def run_sequence(
                             "updates": int(updates),
                             "from_hz": float(from_hz),
                             "to_hz": float(to_hz),
+                            "freq_hz": float(freq),
                         })
 
                         set_freq_and_adaptive_amp(freq)
                         if k < updates:
                             sleep_with_control(
                                 leg_seconds / float(updates),
-                                is_paused=is_paused,
+                                is_paused=_sync_pause_output,
                                 is_stopped=is_stopped,
                                 is_skip=is_skip,
                             )
@@ -937,6 +1003,8 @@ def run_sequence(
                 if dry_run:
                     continue
                 fg.set_channels(channel1=False, channel2=False)
+                active_freqs.clear()
+                pause_restore_freqs.clear()
 
             elif isinstance(step, WaitStep):
                 eff_seconds = float(fixed_wait_seconds) if fixed_wait_seconds is not None else float(step.seconds)
@@ -978,7 +1046,7 @@ def run_sequence(
 
                 sleep_with_control(
                     eff_seconds,
-                    is_paused=is_paused,
+                    is_paused=_sync_pause_output,
                     is_stopped=is_stopped,
                     is_skip=is_skip,
                     on_tick=on_tick if (tick_wait_updates or on_device_state is not None) else None,
