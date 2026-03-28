@@ -28,7 +28,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk curl
+          sudo apt-get install -y python3-tk curl libasound2-dev
 
       - name: Build AppImage
         run: |
