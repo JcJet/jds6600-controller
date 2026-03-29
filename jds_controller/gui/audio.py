@@ -4,6 +4,12 @@ import io
 import math
 import os
 import shutil
+
+try:
+    import pwd  # type: ignore
+except Exception:
+    pwd = None  # type: ignore
+
 import struct
 import subprocess
 import sys
@@ -13,11 +19,6 @@ import time
 import wave
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
-
-try:
-    import pwd  # type: ignore
-except Exception:  # pragma: no cover - unavailable on Windows
-    pwd = None  # type: ignore
 
 ToneSpec = Tuple[float, float, float]  # freq_hz, duration_s, silence_after_s
 

@@ -116,11 +116,32 @@ class LcdPanel(tk.Frame):
         self._progress = 0.0
         self._font_path = _font_path()
         self._overlay = None
+        self._last_state_signature = None
         self._canvas = tk.Canvas(self, bd=0, highlightthickness=0, bg="#2b2b2b")
         self._canvas.pack(fill="both", expand=True)
         self.bind("<Configure>", self._on_resize)
         self._canvas.bind("<Configure>", self._on_resize)
         self.after_idle(self.redraw)
+
+    def _state_signature(self) -> tuple:
+        progress_px = 0
+        try:
+            fill_width = max(1, int(self._width) - 42)
+            progress_px = int(round((max(0.0, min(100.0, float(self._progress))) / 100.0) * fill_width))
+        except Exception:
+            try:
+                progress_px = int(round(float(self._progress)))
+            except Exception:
+                progress_px = 0
+        return (
+            int(self._width or 0),
+            int(self._height or 0),
+            self._primary,
+            self._secondary,
+            self._time_text,
+            self._step_text,
+            progress_px,
+        )
 
     def set_state(self, *, primary: str, secondary: str, time_text: str, step_text: str, progress: float) -> None:
         self._primary = (primary or "").upper()
@@ -131,6 +152,10 @@ class LcdPanel(tk.Frame):
             self._progress = max(0.0, min(100.0, float(progress)))
         except Exception:
             self._progress = 0.0
+        sig = self._state_signature()
+        if sig == self._last_state_signature:
+            return
+        self._last_state_signature = sig
         self.redraw()
 
     def _on_resize(self, _event=None) -> None:
@@ -141,6 +166,7 @@ class LcdPanel(tk.Frame):
             return
         if w != self._width or h != self._height:
             self._width, self._height = w, h
+            self._last_state_signature = None
             self.redraw()
 
     def _char_width(self, size: float) -> float:
@@ -294,6 +320,7 @@ class LcdPanel(tk.Frame):
     def redraw(self) -> None:
         w = max(240, int(self._width or 900))
         h = max(84, int(self._height or 110))
+        self._last_state_signature = self._state_signature()
         c = self._canvas
         c.configure(width=w, height=h)
         c.delete("all")
