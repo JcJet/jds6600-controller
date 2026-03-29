@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import math
 import os
-import pwd
 import shutil
 import struct
 import subprocess
@@ -14,6 +13,11 @@ import time
 import wave
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
+
+try:
+    import pwd  # type: ignore
+except Exception:  # pragma: no cover - unavailable on Windows
+    pwd = None  # type: ignore
 
 ToneSpec = Tuple[float, float, float]  # freq_hz, duration_s, silence_after_s
 
@@ -65,7 +69,7 @@ class TonePlayer:
             runtime_dir = f"/run/user/{uid}"
             env.setdefault("XDG_RUNTIME_DIR", runtime_dir)
             env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
-        if user:
+        if user and pwd is not None:
             try:
                 pw = pwd.getpwnam(user)
                 env["HOME"] = pw.pw_dir
