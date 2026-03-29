@@ -138,6 +138,7 @@ class App(tk.Tk):
         self.shutdown_pc_on_finish = tk.BooleanVar(value=False)
         self.sound_on_finish = tk.BooleanVar(value=False)
         self.dark_theme = tk.BooleanVar(value=bool((self._initial_settings or {}).get("dark_theme", False)))
+        self.heavy_lcd_rendering = tk.BooleanVar(value=bool((self._initial_settings or {}).get("heavy_lcd_rendering", False)))
         self._tone_player = TonePlayer(self)
         self._last_progress_done = 0
         self._last_freq_cue = None
@@ -324,6 +325,14 @@ class App(tk.Tk):
 
     def _toggle_dark_theme(self) -> None:
         self._apply_theme()
+
+    def _toggle_heavy_lcd_rendering(self) -> None:
+        try:
+            if hasattr(self, "lcd_panel") and self.lcd_panel is not None:
+                self.lcd_panel.set_render_mode(bool(self.heavy_lcd_rendering.get()))
+        except Exception:
+            pass
+        self._persist_settings()
 
     def _change_language(self, lang: str) -> None:
         lang = detect_language(lang)
@@ -1134,6 +1143,7 @@ class App(tk.Tk):
     def _refresh_lcd_panel(self) -> None:
         try:
             if hasattr(self, "lcd_panel") and self.lcd_panel is not None:
+                self.lcd_panel.set_render_mode(bool(self.heavy_lcd_rendering.get()))
                 self.lcd_panel.set_state(
                     primary=self.current_primary_var.get(),
                     secondary=self.current_secondary_var.get(),
@@ -1455,6 +1465,8 @@ class App(tk.Tk):
             self.sound_on_finish.set(s["sound_on_finish"])
         if isinstance(s.get("dark_theme"), bool):
             self.dark_theme.set(s["dark_theme"])
+        if isinstance(s.get("heavy_lcd_rendering"), bool):
+            self.heavy_lcd_rendering.set(s["heavy_lcd_rendering"])
         self._apply_theme()
 
         fp = s.get("file_path")
@@ -1499,6 +1511,7 @@ class App(tk.Tk):
             "shutdown_pc_on_finish": bool(self.shutdown_pc_on_finish.get()),
             "sound_on_finish": bool(self.sound_on_finish.get()),
             "dark_theme": bool(self.dark_theme.get()),
+            "heavy_lcd_rendering": bool(self.heavy_lcd_rendering.get()),
             "language": self.lang,
         })
         save_settings(s)
