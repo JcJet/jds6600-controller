@@ -56,7 +56,6 @@ def build_ui(app, *, github_url: str, telegram_url: str) -> None:
     viewmenu = tk.Menu(menubar, tearoff=False)
     app._menus.append(viewmenu)
     viewmenu.add_checkbutton(label=t("menu_dark_theme"), variable=app.dark_theme, command=app._toggle_dark_theme)
-    viewmenu.add_checkbutton(label=t("menu_heavy_lcd_rendering"), variable=app.heavy_lcd_rendering, command=app._toggle_heavy_lcd_rendering)
     menubar.add_cascade(label=t("menu_view"), menu=viewmenu)
 
     langmenu = tk.Menu(menubar, tearoff=False)
@@ -157,7 +156,7 @@ def build_ui(app, *, github_url: str, telegram_url: str) -> None:
     frm_now = ttk.LabelFrame(frm_status, text=t("group_now_playing"))
     frm_now.pack(fill="x", pady=(6, 0))
 
-    app.lcd_panel = LcdPanel(frm_now, height=112, heavy_rendering=bool(app.heavy_lcd_rendering.get()))
+    app.lcd_panel = LcdPanel(frm_now, height=112)
     app.lcd_panel.pack(fill="x", padx=8, pady=8)
 
     frm_mid = ttk.PanedWindow(app, orient="horizontal")

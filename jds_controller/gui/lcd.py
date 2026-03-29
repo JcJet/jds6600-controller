@@ -1,17 +1,7 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-from typing import Optional
-
 import tkinter as tk
 import tkinter.font as tkfont
-
-try:
-    from PIL import Image, ImageDraw, ImageFont, ImageTk
-except Exception:  # pragma: no cover - optional runtime dependency
-    Image = ImageDraw = ImageFont = ImageTk = None  # type: ignore
-
 
 LCD_BG_OUTER = "#1e1f1e"
 LCD_BG_BEZEL = "#35372d"
@@ -23,44 +13,15 @@ LCD_STRIP_BG = "#6f7848"
 LCD_STRIP_FILL = "#245d15"
 
 
-def _assets_root() -> Path:
-    try:
-        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-            return Path(getattr(sys, "_MEIPASS")) / "assets"
-    except Exception:
-        pass
-    try:
-        return Path(__file__).resolve().parents[2] / "assets"
-    except Exception:
-        return Path("assets")
-
-
-def _font_path() -> Optional[Path]:
-    p = _assets_root() / "fonts" / "DSEG14Classic-Regular.ttf"
-    return p if p.exists() else None
-
-
 class LcdPanel(tk.Frame):
-    """LCD-like current-command panel.
+    """Lightweight LCD-like current-command panel.
 
-    Two rendering modes are supported:
-    - simple (default): lightweight Tk canvas text using a broadly available
-      monospace/system font. Safe for Windows 7 and slow machines.
-    - heavy: the old Pillow+TTF overlay renderer with the DSEG font/effects.
-
-    The panel automatically falls back to the lightweight path if heavy mode is
-    requested but Pillow or the bundled DSEG font is unavailable.
+    This renderer intentionally uses only Tk Canvas + system fonts. It stays
+    responsive on slower machines, including Windows 7, while still keeping the
+    same information density and overall instrument-like appearance.
     """
 
-    def __init__(
-        self,
-        master,
-        *,
-        width: int = 900,
-        height: int = 110,
-        heavy_rendering: bool = False,
-        **kwargs,
-    ):
+    def __init__(self, master, *, width: int = 900, height: int = 110, **kwargs):
         super().__init__(master, bd=0, highlightthickness=0, **kwargs)
         self.configure(bg="#2b2b2b")
         self._width = width
@@ -70,10 +31,7 @@ class LcdPanel(tk.Frame):
         self._time_text = "--:--:--"
         self._step_text = ""
         self._progress = 0.0
-        self._font_path = _font_path()
-        self._overlay = None
         self._last_state_signature = None
-        self._heavy_rendering = bool(heavy_rendering)
         self._tk_font_family = None
         self._canvas = tk.Canvas(self, bd=0, highlightthickness=0, bg="#2b2b2b")
         self._canvas.pack(fill="both", expand=True)
@@ -125,16 +83,7 @@ class LcdPanel(tk.Frame):
             self._time_text,
             self._step_text,
             progress_px,
-            bool(self._heavy_rendering),
         )
-
-    def set_render_mode(self, heavy_rendering: bool) -> None:
-        heavy_rendering = bool(heavy_rendering)
-        if heavy_rendering == self._heavy_rendering:
-            return
-        self._heavy_rendering = heavy_rendering
-        self._last_state_signature = None
-        self.redraw()
 
     def set_state(self, *, primary: str, secondary: str, time_text: str, step_text: str, progress: float) -> None:
         self._primary = (primary or "").upper()
@@ -162,14 +111,6 @@ class LcdPanel(tk.Frame):
             self._last_state_signature = None
             self.redraw()
 
-    def _load_font(self, size: int):
-        if ImageFont is None or self._font_path is None:
-            return None
-        try:
-            return ImageFont.truetype(str(self._font_path), size=size)
-        except Exception:
-            return None
-
     def _draw_bezel(self, w: int, h: int) -> tuple[int, int, int, int]:
         c = self._canvas
         c.create_rectangle(0, 0, w, h, fill=LCD_BG_OUTER, outline="#0b0b0b", width=0)
@@ -187,86 +128,10 @@ class LcdPanel(tk.Frame):
             c.create_oval(sx - sr, sy - sr, sx + sr, sy + sr, fill="#565656", outline="#222222")
         return 26, 18, w - 26, h - 26
 
-    def _render_true_font_overlay(self, w: int, h: int, *, left: int, right: int, top: int, fg: str, shadow: str) -> bool:
-        if not self._heavy_rendering:
-            return False
-        if Image is None or ImageDraw is None or ImageTk is None or self._font_path is None:
-            return False
-
-        scale = 2
-        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", getattr(Image, "LANCZOS", 1))
-        img = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-
-        strip_h = max(10, int(h * 0.10))
-        strip_margin = 20
-        text_bottom = h - strip_margin - strip_h - 6
-        available_h = max(28, text_bottom - top)
-
-        main_size = max(18, int(available_h * 0.44 * scale))
-        time_size = max(18, int(available_h * 0.45 * scale))
-        sub_size = max(10, int(available_h * 0.18 * scale))
-
-        font_main = self._load_font(main_size)
-        font_time = self._load_font(time_size)
-        font_sub = self._load_font(sub_size)
-        if font_main is None or font_time is None or font_sub is None:
-            return False
-
-        prim = self._primary[:28]
-        tim = self._time_text[:10]
-        sec = self._secondary[:44]
-        step = self._step_text[:16]
-
-        left_s = left * scale
-        right_s = right * scale
-
-        def text_size(text: str, font) -> tuple[int, int, int]:
-            bbox = d.textbbox((0, 0), text or " ", font=font)
-            if not bbox:
-                return 0, 0, 0
-            return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1]), bbox[1]
-
-        main_w, main_h, main_top = text_size(prim, font_main)
-        _time_w, _time_h, time_top = text_size(tim, font_time)
-        _sub_w, sub_h, sub_top = text_size(sec, font_sub)
-
-        line1_y = top + 5
-        preferred_line2_y = line1_y + int(main_h / scale) - 2
-        max_line2_y = max(line1_y + 2, text_bottom - int(sub_h / scale))
-        line2_y = min(preferred_line2_y, max_line2_y)
-
-        line1_y_s = line1_y * scale
-        line2_y_s = line2_y * scale
-
-        def draw_text(pos_x: int, pos_y: int, text: str, font, *, right_align: bool = False, shadow_dx: int = 5, shadow_dy: int = 4, bbox_top: int = 0) -> None:
-            if not text:
-                return
-            bbox = d.textbbox((0, 0), text, font=font)
-            if not bbox:
-                return
-            tw = max(1, bbox[2] - bbox[0])
-            x = pos_x - tw if right_align else pos_x
-            y = pos_y - bbox_top
-            d.text((x + shadow_dx, y + shadow_dy), text, font=font, fill=shadow)
-            d.text((x, y), text, font=font, fill=fg)
-
-        draw_text(left_s, line1_y_s, prim, font_main, bbox_top=main_top)
-        draw_text(right_s, line1_y_s, tim, font_time, right_align=True, bbox_top=time_top)
-        draw_text(left_s, line2_y_s, sec, font_sub, shadow_dx=4, shadow_dy=3, bbox_top=sub_top)
-        draw_text(right_s, line2_y_s, step, font_sub, right_align=True, shadow_dx=4, shadow_dy=3, bbox_top=sub_top)
-
-        img = img.resize((w, h), resample)
-        self._overlay = ImageTk.PhotoImage(img)
-        self._canvas.create_image(0, 0, image=self._overlay, anchor="nw")
-        return True
-
     def _draw_simple_text_layer(self, w: int, h: int, *, left: int, right: int, top: int) -> None:
         c = self._canvas
         family = self._resolve_tk_font_family()
 
-        # Reserve explicit vertical space for the bottom progress strip so the
-        # secondary line never collides with it on smaller windows.
         strip_h = max(10, int(h * 0.10))
         strip_margin = 20
         text_bottom = h - strip_margin - strip_h - 6
@@ -323,10 +188,7 @@ class LcdPanel(tk.Frame):
         c = self._canvas
         c.configure(width=w, height=h)
         c.delete("all")
-        self._overlay = None
 
         left, top, right, _bottom = self._draw_bezel(w, h)
-        used_true_font = self._render_true_font_overlay(w, h, left=left, right=right, top=top, fg=LCD_FG, shadow=LCD_SHADOW)
-        if not used_true_font:
-            self._draw_simple_text_layer(w, h, left=left, right=right, top=top)
+        self._draw_simple_text_layer(w, h, left=left, right=right, top=top)
         self._draw_progress_strip(w, h)
