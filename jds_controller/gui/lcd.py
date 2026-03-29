@@ -198,9 +198,14 @@ class LcdPanel(tk.Frame):
         img = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
 
-        main_size = max(18, int(h * 0.42 * scale))
-        time_size = max(18, int(h * 0.43 * scale))
-        sub_size = max(10, int(h * 0.18 * scale))
+        strip_h = max(10, int(h * 0.10))
+        strip_margin = 20
+        text_bottom = h - strip_margin - strip_h - 6
+        available_h = max(28, text_bottom - top)
+
+        main_size = max(18, int(available_h * 0.44 * scale))
+        time_size = max(18, int(available_h * 0.45 * scale))
+        sub_size = max(10, int(available_h * 0.18 * scale))
 
         font_main = self._load_font(main_size)
         font_time = self._load_font(time_size)
@@ -215,10 +220,26 @@ class LcdPanel(tk.Frame):
 
         left_s = left * scale
         right_s = right * scale
-        top_s = int((top - 2) * scale)
-        sub_y = int((top + max(34, int(h * 0.44))) * scale)
 
-        def draw_text(pos_x: int, pos_y: int, text: str, font, *, right_align: bool = False, shadow_dx: int = 5, shadow_dy: int = 4) -> None:
+        def text_size(text: str, font) -> tuple[int, int, int]:
+            bbox = d.textbbox((0, 0), text or " ", font=font)
+            if not bbox:
+                return 0, 0, 0
+            return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1]), bbox[1]
+
+        main_w, main_h, main_top = text_size(prim, font_main)
+        _time_w, _time_h, time_top = text_size(tim, font_time)
+        _sub_w, sub_h, sub_top = text_size(sec, font_sub)
+
+        line1_y = top + 5
+        preferred_line2_y = line1_y + int(main_h / scale) - 2
+        max_line2_y = max(line1_y + 2, text_bottom - int(sub_h / scale))
+        line2_y = min(preferred_line2_y, max_line2_y)
+
+        line1_y_s = line1_y * scale
+        line2_y_s = line2_y * scale
+
+        def draw_text(pos_x: int, pos_y: int, text: str, font, *, right_align: bool = False, shadow_dx: int = 5, shadow_dy: int = 4, bbox_top: int = 0) -> None:
             if not text:
                 return
             bbox = d.textbbox((0, 0), text, font=font)
@@ -226,14 +247,14 @@ class LcdPanel(tk.Frame):
                 return
             tw = max(1, bbox[2] - bbox[0])
             x = pos_x - tw if right_align else pos_x
-            y = pos_y - bbox[1]
+            y = pos_y - bbox_top
             d.text((x + shadow_dx, y + shadow_dy), text, font=font, fill=shadow)
             d.text((x, y), text, font=font, fill=fg)
 
-        draw_text(left_s, top_s, prim, font_main)
-        draw_text(right_s, top_s, tim, font_time, right_align=True)
-        draw_text(left_s, sub_y, sec, font_sub, shadow_dx=4, shadow_dy=3)
-        draw_text(right_s, sub_y, step, font_sub, right_align=True, shadow_dx=4, shadow_dy=3)
+        draw_text(left_s, line1_y_s, prim, font_main, bbox_top=main_top)
+        draw_text(right_s, line1_y_s, tim, font_time, right_align=True, bbox_top=time_top)
+        draw_text(left_s, line2_y_s, sec, font_sub, shadow_dx=4, shadow_dy=3, bbox_top=sub_top)
+        draw_text(right_s, line2_y_s, step, font_sub, right_align=True, shadow_dx=4, shadow_dy=3, bbox_top=sub_top)
 
         img = img.resize((w, h), resample)
         self._overlay = ImageTk.PhotoImage(img)
