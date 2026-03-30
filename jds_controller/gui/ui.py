@@ -84,8 +84,10 @@ def build_ui(app, *, github_url: str, telegram_url: str) -> None:
     app.port_combo.grid(row=0, column=1, sticky="we", **pad)
     app.port_combo.bind("<<ComboboxSelected>>", lambda e: app._probe_selected_port_async())
 
-    ttk.Button(frm_top, text=t("btn_refresh"), command=app._refresh_ports).grid(row=0, column=2, **pad)
-    ttk.Button(frm_top, text=t("btn_find_connect"), command=app._auto_detect).grid(row=0, column=3, **pad)
+    app.btn_refresh_ports = ttk.Button(frm_top, text=t("btn_refresh"), command=app._refresh_ports)
+    app.btn_refresh_ports.grid(row=0, column=2, **pad)
+    app.btn_find_connect = ttk.Button(frm_top, text=t("btn_find_connect"), command=app._auto_detect)
+    app.btn_find_connect.grid(row=0, column=3, **pad)
     app.btn_connect = ttk.Button(frm_top, text=t("btn_connect"), command=app._toggle_connection)
     app.btn_connect.grid(row=0, column=4, **pad)
 

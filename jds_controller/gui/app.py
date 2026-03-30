@@ -202,6 +202,13 @@ class App(tk.Tk):
         self._poll_last_error_ts = 0.0
         self._poll_error_throttle_sec = 5.0
 
+        # Port-operation coordination (connect / disconnect / probe / auto-detect).
+        # These jobs must not race with each other on Windows serial ports.
+        self._port_op_lock = threading.Lock()
+        self._port_action_seq = 0
+        self._port_action = None
+        self._pending_probe_after_busy = False
+
         self._build_ui()
         self._apply_theme()
         self.bind_all("<KeyPress-space>", self._on_space_pause_resume, add=True)
@@ -594,8 +601,8 @@ class App(tk.Tk):
         items = []
         if by_id:
             for p in by_id:
-                values.append(p)
                 items.append(UiPortItem(label=f"{p} (by-id)", port=p))
+                values.append(items[-1].label)
         for p in ports:
             items.append(self._format_port_item(p))
             values.append(items[-1].label)
@@ -603,17 +610,16 @@ class App(tk.Tk):
         self._port_items = items
         self.port_combo["values"] = values
 
-        # keep current if still present
-        cur = self.port_var.get().strip()
-        if cur and cur in values:
-            pass
+        selected_port = self._extract_port_value(self.port_var.get()) or (self._connected_port or "")
+        if selected_port:
+            self._set_port_selection(selected_port)
         else:
-            # auto select best if empty
             if by_id:
-                self.port_var.set(by_id[0])
-            elif values:
-                # keep combobox value consistent with its values list (prevents UI glitches)
-                self.port_var.set(values[0])
+                self._set_port_selection(by_id[0])
+            elif items:
+                self.port_var.set(items[0].label)
+            else:
+                self.port_var.set("")
 
         if do_probe:
             self._probe_selected_port_async()
@@ -635,52 +641,164 @@ class App(tk.Tk):
         colors = {"unknown": "#999999", "ok": "#2ecc71", "bad": "#e74c3c"}
         self.device_led.itemconfig(self._led_item, fill=colors.get(state, "#999999"))
 
+    def _same_port(self, a: Optional[str], b: Optional[str]) -> bool:
+        return (a or "").strip() == (b or "").strip()
+
+    def _set_port_selection(self, port: str) -> None:
+        port = (port or "").strip()
+        if not port:
+            self.port_var.set("")
+            return
+        for it in getattr(self, "_port_items", []):
+            if self._same_port(it.port, port):
+                self.port_var.set(it.label)
+                return
+        self.port_var.set(port)
+
+    def _set_connection_busy(self, kind: str, target: str = "") -> int:
+        self._port_action_seq += 1
+        self._port_action = {"id": int(self._port_action_seq), "kind": str(kind), "target": str(target or "")}
+        self._update_connection_controls()
+        return int(self._port_action_seq)
+
+    def _clear_connection_busy(self, op_id: Optional[int] = None) -> bool:
+        active = getattr(self, "_port_action", None)
+        if active is None:
+            return False
+        try:
+            active_id = int(active.get("id", -1))
+        except Exception:
+            active_id = -1
+        if op_id is not None and active_id != int(op_id):
+            return False
+        self._port_action = None
+        self._update_connection_controls()
+        if self._pending_probe_after_busy and (not self._running):
+            self._pending_probe_after_busy = False
+            try:
+                self.after(50, self._probe_selected_port_async)
+            except Exception:
+                pass
+        return True
+
+    def _note_connection_busy(self) -> None:
+        active = getattr(self, "_port_action", None) or {}
+        kind = str(active.get("kind") or "")
+        target = str(active.get("target") or "")
+        if kind == "connect" and target:
+            msg = self.tr("log_connect_busy", port=target)
+        elif kind == "disconnect" and target:
+            msg = self.tr("log_disconnect_busy", port=target)
+        elif kind == "autodetect":
+            msg = self.tr("log_autodetect_busy")
+        else:
+            msg = self.tr("log_port_operation_busy")
+        self._log(msg)
+        try:
+            self.status_var.set(self.tr("status_port_operation_busy"))
+        except Exception:
+            pass
+
+    def _update_connection_controls(self) -> None:
+        busy = bool(self._running or getattr(self, "_port_action", None))
+        try:
+            self.port_combo.configure(state="disabled" if busy else "readonly")
+        except Exception:
+            pass
+        for name in ("btn_refresh_ports", "btn_find_connect", "btn_connect"):
+            try:
+                getattr(self, name).configure(state="disabled" if busy else "normal")
+            except Exception:
+                pass
+        try:
+            self.btn_start.configure(state="disabled" if busy else "normal")
+        except Exception:
+            pass
+
+    def _format_port_error_for_ui(self, port: str, error) -> str:
+        raw = "" if error is None else str(error).strip()
+        low = raw.lower()
+        if ("permissionerror" in low) or ("access is denied" in low) or ("отказано в доступе" in low):
+            return self.tr("msg_port_access_denied", port=port, error=raw)
+        if ("could not open port" in low) or ("device or resource busy" in low) or ("resource busy" in low):
+            return self.tr("msg_port_busy", port=port, error=raw)
+        return raw or self.tr("status_error")
+
     def _probe_selected_port_async(self):
+        if self._running:
+            return
         port = self._extract_port_value(self.port_var.get())
         if not port:
             self.device_var.set(self.tr("device_not_selected"))
             self._set_led("unknown")
             return
+        if self._connected and self._same_port(self._connected_port, port):
+            self.device_var.set(self.tr("device_connected"))
+            self._set_led("ok")
+            return
+        if getattr(self, "_port_action", None):
+            self._pending_probe_after_busy = True
+            return
+
+        op_id = self._set_connection_busy("probe", port)
         self.device_var.set(self.tr("device_checking"))
         self._set_led("unknown")
 
-        def worker():
+        def worker(op_id_local: int, port_local: str):
             ok = False
             try:
-                if self._connected and self._connected_port == port:
-                    ok = True
-                else:
-                    with self._io_lock:
-                        if self._connected and self._connected_port == port:
-                            ok = True
-                        else:
-                            import jds6600
-                            fg = jds6600.JDS6600(port=port)
-                            fg.connect()
-                            try:
-                                fg.get_channels()
-                            finally:
-                                fg.close()
-                            ok = True
+                with self._port_op_lock:
+                    if self._connected and self._same_port(self._connected_port, port_local):
+                        ok = True
+                    else:
+                        with self._io_lock:
+                            if self._connected and self._same_port(self._connected_port, port_local):
+                                ok = True
+                            else:
+                                import jds6600
+                                fg = jds6600.JDS6600(port=port_local)
+                                fg.connect()
+                                try:
+                                    fg.get_channels()
+                                finally:
+                                    fg.close()
+                                ok = True
             except Exception:
                 ok = False
-            self.msgq.put(GuiMsg(MsgKind.PROBE, bool(ok)))
+            self.msgq.put(GuiMsg(MsgKind.PROBE, {"op_id": int(op_id_local), "port": port_local, "ok": bool(ok)}))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, args=(op_id, port), daemon=True).start()
 
     def _auto_detect(self):
+        if self._running:
+            self._log(self.tr("log_connect_managed"))
+            return
+        if getattr(self, "_port_action", None):
+            self._note_connection_busy()
+            return
+        if self._connected and self._connected_port:
+            self._set_port_selection(self._connected_port)
+            self.device_var.set(self.tr("device_connected"))
+            self._set_led("ok")
+            self.status_var.set(self.tr("status_connected_to", port=self._connected_port))
+            self._log(self.tr("log_autodetect_skip_connected", port=self._connected_port))
+            return
+
+        op_id = self._set_connection_busy("autodetect", "")
         self.status_var.set(self.tr("status_searching_device"))
+        self.device_var.set(self.tr("device_checking"))
+        self._set_led("unknown")
         self._log(self.tr("log_autodetect_start"))
 
-        def worker():
-            import jds6600
+        def worker(op_id_local: int):
             try:
-                port = find_first_jds6600()
-                self.msgq.put(GuiMsg(MsgKind.AUTODETECT, port or ""))
+                with self._port_op_lock:
+                    port = find_first_jds6600()
+                self.msgq.put(GuiMsg(MsgKind.AUTODETECT, {"op_id": int(op_id_local), "port": port or "", "error": ""}))
             except Exception as e:
-                self.msgq.put(GuiMsg(MsgKind.ERROR, self.tr("log_autodetect_error", error=e)))
+                self.msgq.put(GuiMsg(MsgKind.AUTODETECT, {"op_id": int(op_id_local), "port": "", "error": str(e)}))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, args=(op_id,), daemon=True).start()
 
     # ---------------- Run logic ----------------
 
@@ -810,10 +928,11 @@ class App(tk.Tk):
 
     def _set_running_ui(self, running: bool):
         self._running = running
-        self.btn_start.config(state="disabled" if running else "normal")
+        self.btn_start.config(state="disabled" if (running or getattr(self, "_port_action", None)) else "normal")
         self.btn_pause.config(state="normal" if running else "disabled")
         self.btn_next.config(state="normal" if running else "disabled")
         self.btn_stop.config(state="normal" if running else "disabled")
+        self._update_connection_controls()
         if not running:
             self.btn_pause.config(text=self.tr("btn_pause"))
             self._clear_current_panel()
@@ -931,6 +1050,10 @@ class App(tk.Tk):
 
     def _start(self):
         if self.worker and self.worker.is_alive():
+            return
+        if getattr(self, "_port_action", None):
+            self._note_connection_busy()
+            messagebox.showerror(self.tr("title_connect_error"), self.tr("msg_connection_busy_wait"))
             return
 
         port = self._extract_port_value(self.port_var.get())
@@ -1600,65 +1723,103 @@ class App(tk.Tk):
                     self._log(txt)
 
                 elif kind == MsgKind.PROBE:
-                    ok = bool(payload)
+                    data = payload if isinstance(payload, dict) else {"ok": bool(payload)}
+                    op_id = data.get("op_id") if isinstance(data, dict) else None
+                    if not self._clear_connection_busy(op_id if op_id is not None else None):
+                        continue
+                    ok = bool(data.get("ok", False)) if isinstance(data, dict) else bool(payload)
                     if ok:
-                        self.device_var.set(self.tr("device_found"))
+                        if self._connected and self._same_port(self._connected_port, self._extract_port_value(self.port_var.get())):
+                            self.device_var.set(self.tr("device_connected"))
+                        else:
+                            self.device_var.set(self.tr("device_found"))
                         self._set_led("ok")
                     else:
                         self.device_var.set(self.tr("device_not_found"))
                         self._set_led("bad")
 
                 elif kind == MsgKind.AUTODETECT:
-                    port = str(payload or "")
+                    data = payload if isinstance(payload, dict) else {"port": payload}
+                    op_id = data.get("op_id") if isinstance(data, dict) else None
+                    if not self._clear_connection_busy(op_id if op_id is not None else None):
+                        continue
+                    port = str(data.get("port") or "") if isinstance(data, dict) else str(payload or "")
+                    err_text = str(data.get("error") or "") if isinstance(data, dict) else ""
                     if port:
-                        self.port_var.set(port)
+                        self._set_port_selection(port)
                         self.device_var.set(self.tr("device_found"))
                         self._set_led("ok")
                         # Auto-connect after successful auto-detect.
-                        # Do not start a separate probe here: it races with connect on first launch.
-                        self._connect_selected_port_async()
-                        self.status_var.set(self.tr("status_device_found", port=port))
                         self._log(self.tr("log_autodetect_found", port=port))
+                        self._connect_selected_port_async()
                     else:
+                        self.device_var.set(self.tr("device_not_found"))
+                        self._set_led("bad")
                         self.status_var.set(self.tr("status_device_not_found"))
-                        self._log(self.tr("log_autodetect_not_found"))
+                        if err_text:
+                            self._log(self.tr("log_autodetect_error", error=err_text))
+                        else:
+                            self._log(self.tr("log_autodetect_not_found"))
 
                 elif kind == MsgKind.CONNECTED:
-                    port = str(payload or "")
+                    data = payload if isinstance(payload, dict) else {"port": payload}
+                    op_id = data.get("op_id") if isinstance(data, dict) else None
+                    silent_msg = bool(data.get("silent", False)) if isinstance(data, dict) else False
+                    if op_id is not None:
+                        self._clear_connection_busy(op_id)
+                    port = str(data.get("port") or "") if isinstance(data, dict) else str(payload or "")
+                    self._set_port_selection(port)
                     self._set_connected_ui(True, port)
+                    self.device_var.set(self.tr("device_connected"))
+                    self._set_led("ok")
+                    self.status_var.set(self.tr("status_connected_to", port=port))
+                    if port and (not silent_msg):
+                        self._log(self.tr("log_connected", port=port))
                     # Wake the polling loop so the status bar shows real device state ASAP.
                     try:
                         self._poll_force.set()
                     except Exception:
                         pass
-                    # Keep the top status label in sync (avoid being stuck on 'Не подключено' at startup).
-                    try:
-                        if (not self._running) and (self.status_var.get() in (self.tr("status_not_connected"), "", "Не подключено", "Not connected")):
-                            self.status_var.set(self.tr("status_connected"))
-                    except Exception:
-                        pass
 
                 elif kind == MsgKind.DISCONNECTED:
+                    data = payload if isinstance(payload, dict) else {"port": payload}
+                    op_id = data.get("op_id") if isinstance(data, dict) else None
+                    if op_id is not None:
+                        self._clear_connection_busy(op_id)
+                    port = str(data.get("port") or "") if isinstance(data, dict) else str(payload or "")
                     self._set_connected_ui(False)
+                    self.device_var.set(self.tr("device_unchecked"))
+                    self._set_led("unknown")
                     try:
                         if not self._running:
                             self.status_var.set(self.tr("status_not_connected"))
                     except Exception:
                         pass
+                    if port:
+                        self._log(self.tr("log_disconnected", port=port))
 
                 elif kind == MsgKind.CONNECT_ERROR:
+                    data = payload if isinstance(payload, dict) else {"error": payload}
+                    op_id = data.get("op_id") if isinstance(data, dict) else None
+                    if op_id is not None:
+                        self._clear_connection_busy(op_id)
                     self._set_connected_ui(False)
                     show_popup = True
                     err_text = payload
+                    port = ""
                     try:
-                        if isinstance(payload, dict):
-                            err_text = str(payload.get("error", ""))
-                            show_popup = bool(payload.get("show_popup", True))
+                        if isinstance(data, dict):
+                            port = str(data.get("port", "") or "")
+                            err_text = self._format_port_error_for_ui(port, data.get("error", ""))
+                            show_popup = bool(data.get("show_popup", True))
                     except Exception:
                         err_text = str(payload)
                         show_popup = True
+                    self.device_var.set(self.tr("device_not_found"))
+                    self._set_led("bad")
+                    self.status_var.set(self.tr("status_not_connected"))
+                    self._log(self.tr("log_connect_error", error=err_text))
                     if show_popup:
-                        self._log(self.tr("log_connect_error", error=err_text))
                         messagebox.showerror(self.tr("title_connect_error"), str(err_text))
 
                 elif kind == MsgKind.DEVICE_STATE:
@@ -1805,7 +1966,12 @@ class App(tk.Tk):
                     if self._reconnect_after_run:
                         self._reconnect_after_run = False
                         if (not should_shutdown_pc) and (not self._connected):
-                            self._connect_selected_port_async()
+                            try:
+                                if self._reconnect_after_run_port:
+                                    self._set_port_selection(self._reconnect_after_run_port)
+                            except Exception:
+                                pass
+                            self._connect_selected_port_async(silent=True)
 
                 elif kind == MsgKind.ERROR:
                     self.status_var.set(self.tr("status_error"))
@@ -1817,7 +1983,12 @@ class App(tk.Tk):
                     if self._reconnect_after_run:
                         self._reconnect_after_run = False
                         if not self._connected:
-                            self._connect_selected_port_async()
+                            try:
+                                if self._reconnect_after_run_port:
+                                    self._set_port_selection(self._reconnect_after_run_port)
+                            except Exception:
+                                pass
+                            self._connect_selected_port_async(silent=True)
 
         except queue.Empty:
             pass
@@ -2113,49 +2284,80 @@ class App(tk.Tk):
             # during execution we keep the script priority; manual connect/disconnect is disabled
             self._log(self.tr("log_connect_managed"))
             return
+        if getattr(self, "_port_action", None):
+            self._note_connection_busy()
+            return
         if self._connected:
             self._disconnect_async()
         else:
             self._connect_selected_port_async()
 
     def _connect_selected_port_async(self, silent: bool = False) -> None:
+        if self._running:
+            self._log(self.tr("log_connect_managed"))
+            return
+        if getattr(self, "_port_action", None):
+            self._note_connection_busy()
+            return
+
         port = self._extract_port_value(self.port_var.get())
         if not port:
             self._log(self.tr("log_port_not_selected"))
             return
         # Already connected to this port
-        if self._connected and self._connected_port == port:
+        if self._connected and self._same_port(self._connected_port, port):
+            self._set_port_selection(port)
+            self.device_var.set(self.tr("device_connected"))
+            self._set_led("ok")
+            self.status_var.set(self.tr("status_connected_to", port=port))
             return
 
-        def worker():
+        op_id = self._set_connection_busy("connect", port)
+        self.status_var.set(self.tr("status_connecting", port=port))
+        self.device_var.set(self.tr("device_connecting"))
+        self._set_led("unknown")
+        if not silent:
+            self._log(self.tr("log_connecting", port=port))
+
+        def worker(op_id_local: int, port_local: str, silent_local: bool):
             import jds6600
             last_err = None
-            for attempt in range(2):
-                try:
-                    with self._io_lock:
-                        fg = jds6600.JDS6600(port=port)
-                        fg.connect()
-                        with self._fg_lock:
-                            # close previous connection if any
+            try:
+                with self._port_op_lock:
+                    if self._connected and self._same_port(self._connected_port, port_local):
+                        self.msgq.put(GuiMsg(MsgKind.CONNECTED, {"op_id": int(op_id_local), "port": port_local, "silent": bool(silent_local)}))
+                        return
+                    if self._connected:
+                        self._disconnect_sync()
+                    for _ in range(2):
+                        fg = None
+                        try:
+                            with self._io_lock:
+                                fg = jds6600.JDS6600(port=port_local)
+                                fg.connect()
+                                fg.get_channels()
+                            with self._fg_lock:
+                                self._fg = fg
+                                self._connected = True
+                                self._connected_port = port_local
+                            self.msgq.put(GuiMsg(MsgKind.CONNECTED, {"op_id": int(op_id_local), "port": port_local, "silent": bool(silent_local)}))
+                            return
+                        except Exception as e:
+                            last_err = e
                             try:
-                                if self._fg is not None:
-                                    self._fg.close()
+                                if fg is not None:
+                                    fg.close()
                             except Exception:
                                 pass
-                            self._fg = fg
-                            self._connected = True
-                            self._connected_port = port
-                    self.msgq.put(GuiMsg(MsgKind.CONNECTED, port))
-                    return
-                except Exception as e:
-                    last_err = e
-                    try:
-                        time.sleep(0.25)
-                    except Exception:
-                        pass
-            self.msgq.put(GuiMsg(MsgKind.CONNECT_ERROR, {"error": str(last_err), "show_popup": (not silent)}))
+                            try:
+                                time.sleep(0.25)
+                            except Exception:
+                                pass
+            except Exception as e:
+                last_err = e
+            self.msgq.put(GuiMsg(MsgKind.CONNECT_ERROR, {"op_id": int(op_id_local), "port": port_local, "error": str(last_err), "show_popup": (not silent_local)}))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, args=(op_id, port, silent), daemon=True).start()
 
     def _handle_normal_finish_actions(self) -> None:
         disable_outputs = bool(self.disable_outputs_on_finish.get())
@@ -2184,27 +2386,28 @@ class App(tk.Tk):
                         # If the port is still being released by the runner, wait a bit and retry.
                         if not done:
                             last_err = None
-                            for _ in range(12):
-                                fg = None
-                                try:
-                                    with self._io_lock:
-                                        fg = jds6600.JDS6600(port=port)
-                                        fg.connect()
-                                        fg.set_channels(channel1=False, channel2=False)
-                                    done = True
-                                    break
-                                except Exception as e:
-                                    last_err = e
+                            with self._port_op_lock:
+                                for _ in range(12):
+                                    fg = None
                                     try:
-                                        time.sleep(0.25)
-                                    except Exception:
-                                        pass
-                                finally:
-                                    if fg is not None:
+                                        with self._io_lock:
+                                            fg = jds6600.JDS6600(port=port)
+                                            fg.connect()
+                                            fg.set_channels(channel1=False, channel2=False)
+                                        done = True
+                                        break
+                                    except Exception as e:
+                                        last_err = e
                                         try:
-                                            fg.close()
+                                            time.sleep(0.25)
                                         except Exception:
                                             pass
+                                    finally:
+                                        if fg is not None:
+                                            try:
+                                                fg.close()
+                                            except Exception:
+                                                pass
                             if not done and last_err is not None:
                                 raise last_err
 
@@ -2239,23 +2442,39 @@ class App(tk.Tk):
 
     def _disconnect_sync(self) -> None:
         """Close current connection. Can be called from any thread."""
-        with self._fg_lock:
-            fg = self._fg
-            self._fg = None
-            self._connected = False
-            self._connected_port = None
-        try:
-            if fg is not None:
-                fg.close()
-        except Exception:
-            pass
+        with self._io_lock:
+            with self._fg_lock:
+                fg = self._fg
+                self._fg = None
+                self._connected = False
+                self._connected_port = None
+            try:
+                if fg is not None:
+                    fg.close()
+            except Exception:
+                pass
 
     def _disconnect_async(self) -> None:
-        def worker():
-            self._disconnect_sync()
-            self.msgq.put(GuiMsg(MsgKind.DISCONNECTED, None))
+        if self._running:
+            self._log(self.tr("log_connect_managed"))
+            return
+        if getattr(self, "_port_action", None):
+            self._note_connection_busy()
+            return
+        port = self._connected_port or self._extract_port_value(self.port_var.get())
+        op_id = self._set_connection_busy("disconnect", port or "")
+        self.status_var.set(self.tr("status_disconnecting"))
+        self.device_var.set(self.tr("device_disconnecting"))
+        self._set_led("unknown")
+        if port:
+            self._log(self.tr("log_disconnecting", port=port))
 
-        threading.Thread(target=worker, daemon=True).start()
+        def worker(op_id_local: int, port_local: str):
+            with self._port_op_lock:
+                self._disconnect_sync()
+            self.msgq.put(GuiMsg(MsgKind.DISCONNECTED, {"op_id": int(op_id_local), "port": port_local}))
+
+        threading.Thread(target=worker, args=(op_id, port or ""), daemon=True).start()
 
     def _poll_loop(self) -> None:
         """Poll generator state (~1 Hz) when the GUI is idle.
